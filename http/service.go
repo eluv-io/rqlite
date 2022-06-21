@@ -22,11 +22,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rqlite/rqlite/auth"
-	"github.com/rqlite/rqlite/command"
-	"github.com/rqlite/rqlite/command/encoding"
-	"github.com/rqlite/rqlite/queue"
-	"github.com/rqlite/rqlite/store"
+	"github.com/rqlite/rqlite/v7/auth"
+	"github.com/rqlite/rqlite/v7/command"
+	"github.com/rqlite/rqlite/v7/command/encoding"
+	"github.com/rqlite/rqlite/v7/queue"
+	"github.com/rqlite/rqlite/v7/store"
 )
 
 var (

@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	httpd "github.com/rqlite/rqlite/http"
+	httpd "github.com/rqlite/rqlite/v7/http"
 )
 
 func init() {

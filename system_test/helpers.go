@@ -17,12 +17,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rqlite/rqlite/cluster"
-	"github.com/rqlite/rqlite/command/encoding"
-	httpd "github.com/rqlite/rqlite/http"
-	"github.com/rqlite/rqlite/store"
-	"github.com/rqlite/rqlite/tcp"
-	rX509 "github.com/rqlite/rqlite/testdata/x509"
+	"github.com/rqlite/rqlite/v7/cluster"
+	"github.com/rqlite/rqlite/v7/command/encoding"
+	httpd "github.com/rqlite/rqlite/v7/http"
+	"github.com/rqlite/rqlite/v7/store"
+	"github.com/rqlite/rqlite/v7/tcp"
+	rX509 "github.com/rqlite/rqlite/v7/testdata/x509"
 )
 
 const (

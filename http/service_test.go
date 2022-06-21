@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rqlite/rqlite/command"
-	"github.com/rqlite/rqlite/store"
-	"github.com/rqlite/rqlite/testdata/x509"
+	"github.com/rqlite/rqlite/v7/command"
+	"github.com/rqlite/rqlite/v7/store"
+	"github.com/rqlite/rqlite/v7/testdata/x509"
 
 	"golang.org/x/net/http2"
 )

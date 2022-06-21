@@ -1,5 +1,4 @@
-// Command rqlited is the rqlite server.
-package main
+package embedded
 
 import (
 	"crypto/tls"
@@ -10,12 +9,11 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"time"
 
+	"github.com/pkg/errors"
 	consul "github.com/rqlite/rqlite-disco-clients/consul"
 	"github.com/rqlite/rqlite-disco-clients/dns"
 	"github.com/rqlite/rqlite-disco-clients/dnssrv"
@@ -30,137 +28,123 @@ import (
 	"github.com/rqlite/rqlite/v7/tcp"
 )
 
-const logo = `
-            _ _ _
-           | (_) |
-  _ __ __ _| |_| |_ ___
- | '__/ _  | | | __/ _ \   The lightweight, distributed
- | | | (_| | | | ||  __/   relational database.
- |_|  \__, |_|_|\__\___|
-         | |               www.rqlite.io
-         |_|
+const (
+	name = "embedded rqlite daemon"
+)
 
-`
-
-const name = `rqlited`
-const desc = `rqlite is a lightweight, distributed relational database, which uses SQLite as its
-storage engine. It provides an easy-to-use, fault-tolerant store for relational data.`
-
-func init() {
-	log.SetFlags(log.LstdFlags)
-	log.SetOutput(os.Stderr)
-	log.SetPrefix(fmt.Sprintf("[%s] ", name))
+type Embedded struct {
+	Config       *Config
+	raftListener net.Listener
+	cluster      *cluster.Service
+	store        *store.Store
 }
 
-func main() {
-	cfg, err := ParseFlags(name, desc, &BuildInfo{
-		Version: cmd.Version,
-		Commit:  cmd.Commit,
-		Branch:  cmd.Branch,
-	})
+// Shutdown stops the daemon gracefully.
+func (emb *Embedded) Shutdown() (err error) {
+	if emb.store != nil {
+		err = emb.store.Close(true)
+	}
+	if emb.cluster != nil {
+		_ = emb.cluster.Close()
+	}
+	if emb.raftListener != nil {
+		_ = emb.raftListener.Close()
+	}
+	return err
+}
+
+// New creates a new embedded daemon
+func New(config Config) (*Embedded, error) {
+	var err error
+	cfg := &config
+
+	err = cfg.Validate()
 	if err != nil {
-		log.Fatalf("failed to parse command-line flags: %s", err.Error())
+		return nil, errors.WithMessage(err, "invalid config")
 	}
 
-	// Display logo.
-	fmt.Printf(logo)
-
-	// Configure logging and pump out initial message.
-	log.Printf("%s starting, version %s, commit %s, branch %s, compiler %s", name, cmd.Version, cmd.Commit, cmd.Branch, runtime.Compiler)
-	log.Printf("%s, target architecture is %s, operating system target is %s", runtime.Version(), runtime.GOARCH, runtime.GOOS)
-	log.Printf("launch command: %s", strings.Join(os.Args, " "))
-
-	// Start requested profiling.
-	startProfile(cfg.CPUProfile, cfg.MemProfile)
-
-	// Create internode network mux and configure.
-	muxLn, err := net.Listen("tcp", cfg.RaftAddr)
-	if err != nil {
-		log.Fatalf("failed to listen on %s: %s", cfg.RaftAddr, err.Error())
+	emb := &Embedded{
+		Config: cfg,
 	}
-	mux, err := startNodeMux(cfg, muxLn)
+
+	defer func() {
+		if err != nil {
+			_ = emb.Shutdown()
+		}
+	}()
+
+	// Create inter-node network mux and configure.
+	emb.raftListener, err = net.Listen("tcp", cfg.RaftAddr)
 	if err != nil {
-		log.Fatalf("failed to start node mux: %s", err.Error())
+		return nil, errors.WithMessagef(err, "create raft listener at [%s]", cfg.RaftAddr)
+	}
+	mux, err := startNodeMux(cfg, emb.raftListener)
+	if err != nil {
+		return nil, errors.WithMessage(err, "start node mux")
 	}
 	raftTn := mux.Listen(cluster.MuxRaftHeader)
 	log.Printf("Raft TCP mux Listener registered with %d", cluster.MuxRaftHeader)
 
 	// Create the store.
-	str, err := createStore(cfg, raftTn)
+	emb.store, err = createStore(cfg, raftTn)
 	if err != nil {
-		log.Fatalf("failed to create store: %s", err.Error())
+		return nil, errors.WithMessage(err, "create store")
 	}
-
 	// Now, open store.
-	if err := str.Open(); err != nil {
-		log.Fatalf("failed to open store: %s", err.Error())
+	if err := emb.store.Open(); err != nil {
+		return nil, errors.WithMessage(err, "open store")
 	}
 
 	// Get any credential store.
 	credStr, err := credentialStore(cfg)
 	if err != nil {
-		log.Fatalf("failed to get credential store: %s", err.Error())
+		return nil, errors.WithMessage(err, "create credential store")
 	}
 
 	// Create cluster service now, so nodes will be able to learn information about each other.
-	clstr, err := clusterService(cfg, mux.Listen(cluster.MuxClusterHeader), str)
+	emb.cluster, err = clusterService(cfg, mux.Listen(cluster.MuxClusterHeader), emb.store)
 	if err != nil {
-		log.Fatalf("failed to create cluster service: %s", err.Error())
+		return nil, errors.WithMessage(err, "create cluster service")
 	}
 	log.Printf("cluster TCP mux Listener registered with %d", cluster.MuxClusterHeader)
 
 	// Start the HTTP API server.
 	clstrDialer := tcp.NewDialer(cluster.MuxClusterHeader, cfg.NodeEncrypt, cfg.NoNodeVerify)
 	clstrClient := cluster.NewClient(clstrDialer, cfg.ClusterConnectTimeout)
-	if err := clstrClient.SetLocal(cfg.RaftAdv, clstr); err != nil {
-		log.Fatalf("failed to set cluster client local parameters: %s", err.Error())
+	if err := clstrClient.SetLocal(cfg.RaftAdv, emb.cluster); err != nil {
+		return nil, errors.WithMessage(err, "set cluster client local parameters")
 	}
-	httpServ, err := startHTTPService(cfg, str, clstrClient, credStr)
+	httpServ, err := startHTTPService(cfg, emb.store, clstrClient, credStr)
 	if err != nil {
-		log.Fatalf("failed to start HTTP server: %s", err.Error())
+		return nil, errors.WithMessage(err, "start HTTP server")
 	}
 
 	// Register remaining status providers.
-	httpServ.RegisterStatus("cluster", clstr)
+	_ = httpServ.RegisterStatus("cluster", emb.cluster)
 
 	tlsConfig := tls.Config{InsecureSkipVerify: cfg.NoHTTPVerify}
 	if cfg.X509CACert != "" {
 		asn1Data, err := ioutil.ReadFile(cfg.X509CACert)
 		if err != nil {
-			log.Fatalf("ioutil.ReadFile failed: %s", err.Error())
+			return nil, errors.WithMessagef(err, "reading ca cert [%s]", cfg.X509CACert)
 		}
 		tlsConfig.RootCAs = x509.NewCertPool()
 		ok := tlsConfig.RootCAs.AppendCertsFromPEM(asn1Data)
 		if !ok {
-			log.Fatalf("failed to parse root CA certificate(s) in %q", cfg.X509CACert)
+			return nil, fmt.Errorf("failed to parse root CA certificate(s) in %q", cfg.X509CACert)
 		}
 	}
 
 	// Create the cluster!
-	nodes, err := str.Nodes()
+	nodes, err := emb.store.Nodes()
 	if err != nil {
-		log.Fatalf("failed to get nodes %s", err.Error())
+		return nil, errors.WithMessage(err, "get nodes")
 	}
-	if err := createCluster(cfg, &tlsConfig, len(nodes) > 0, str, httpServ, credStr); err != nil {
-		log.Fatalf("clustering failure: %s", err.Error())
+	if err := createCluster(cfg, &tlsConfig, len(nodes) > 0, emb.store, httpServ, credStr); err != nil {
+		return nil, errors.WithMessage(err, "create cluster")
 	}
 
-	// Tell the user the node is ready for HTTP, giving some advice on how to connect.
-	log.Printf("node HTTP API available at %s", cfg.HTTPURL())
-	h, p, _ := net.SplitHostPort(cfg.HTTPAdv)
-	log.Printf("connect using the command-line tool via 'rqlite -H %s -p %s'", h, p)
-
-	// Block until signalled.
-	terminate := make(chan os.Signal, 1)
-	signal.Notify(terminate, os.Interrupt)
-	<-terminate
-	if err := str.Close(true); err != nil {
-		log.Printf("failed to close store: %s", err.Error())
-	}
-	clstr.Close()
-	muxLn.Close()
-	stopProfile()
-	log.Println("rqlite server stopped")
+	return emb, nil
 }
 
 func createStore(cfg *Config, ln *tcp.Layer) (*store.Store, error) {

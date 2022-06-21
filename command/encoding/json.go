@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/rqlite/rqlite/command"
+	"github.com/rqlite/rqlite/v7/command"
 )
 
 // Result represents the outcome of an operation that changes rows.

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rqlite/rqlite/store"
+	"github.com/rqlite/rqlite/v7/store"
 )
 
 func Test_SingleNodeBasicEndpoint(t *testing.T) {

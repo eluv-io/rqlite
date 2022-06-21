@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rqlite/rqlite/command"
+	"github.com/rqlite/rqlite/v7/command"
 )
 
 var (
