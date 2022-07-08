@@ -293,6 +293,10 @@ func New(addr string, store Store, cluster Cluster, credentials CredentialStore)
 	}
 }
 
+func (s *Service) Logger() *log.Logger {
+	return s.logger
+}
+
 // Start starts the service.
 func (s *Service) Start() error {
 	server := http.Server{

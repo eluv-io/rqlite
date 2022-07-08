@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
+	golog "log"
 	"net"
 	"os"
 	"path/filepath"
@@ -32,11 +32,20 @@ const (
 	name = "embedded rqlite daemon"
 )
 
+var log = golog.Default()
+
 type Embedded struct {
 	Config       *Config
 	raftListener net.Listener
 	cluster      *cluster.Service
 	store        *store.Store
+	startFn      func() error
+	httpdService *httpd.Service
+}
+
+// Start starts the node by joining it to the cluster.
+func (emb *Embedded) Start() (err error) {
+	return emb.startFn()
 }
 
 // Shutdown stops the daemon gracefully.
@@ -50,6 +59,9 @@ func (emb *Embedded) Shutdown() (err error) {
 	if emb.raftListener != nil {
 		_ = emb.raftListener.Close()
 	}
+	if emb.httpdService != nil {
+		emb.httpdService.Close()
+	}
 	return err
 }
 
@@ -57,6 +69,8 @@ func (emb *Embedded) Shutdown() (err error) {
 func New(config Config) (*Embedded, error) {
 	var err error
 	cfg := &config
+
+	log = adaptLogger(cfg, golog.New(os.Stderr, "embedded", 0))
 
 	err = cfg.Validate()
 	if err != nil {
@@ -111,16 +125,16 @@ func New(config Config) (*Embedded, error) {
 	// Start the HTTP API server.
 	clstrDialer := tcp.NewDialer(cluster.MuxClusterHeader, cfg.NodeEncrypt, cfg.NoNodeVerify)
 	clstrClient := cluster.NewClient(clstrDialer, cfg.ClusterConnectTimeout)
-	if err := clstrClient.SetLocal(cfg.RaftAdv, emb.cluster); err != nil {
+	if err = clstrClient.SetLocal(cfg.RaftAdv, emb.cluster); err != nil {
 		return nil, errors.WithMessage(err, "set cluster client local parameters")
 	}
-	httpServ, err := startHTTPService(cfg, emb.store, clstrClient, credStr)
+	emb.httpdService, err = startHTTPService(cfg, emb.store, clstrClient, credStr)
 	if err != nil {
 		return nil, errors.WithMessage(err, "start HTTP server")
 	}
 
 	// Register remaining status providers.
-	_ = httpServ.RegisterStatus("cluster", emb.cluster)
+	_ = emb.httpdService.RegisterStatus("cluster", emb.cluster)
 
 	tlsConfig := tls.Config{InsecureSkipVerify: cfg.NoHTTPVerify}
 	if cfg.X509CACert != "" {
@@ -140,7 +154,8 @@ func New(config Config) (*Embedded, error) {
 	if err != nil {
 		return nil, errors.WithMessage(err, "get nodes")
 	}
-	if err := createCluster(cfg, &tlsConfig, len(nodes) > 0, emb.store, httpServ, credStr); err != nil {
+	emb.startFn, err = createCluster(cfg, &tlsConfig, len(nodes) > 0, emb.store, emb.httpdService, credStr)
+	if err != nil {
 		return nil, errors.WithMessage(err, "create cluster")
 	}
 
@@ -160,12 +175,14 @@ func createStore(cfg *Config, ln *tcp.Layer) (*store.Store, error) {
 		DBConf: dbConf,
 		Dir:    cfg.DataPath,
 		ID:     cfg.NodeID,
+		Logger: adaptLogger(cfg, golog.New(os.Stderr, "[store] ", golog.LstdFlags)),
 	})
 
 	// Set optional parameters on store.
 	str.StartupOnDisk = cfg.OnDiskStartup
 	str.SetRequestCompression(cfg.CompressionBatch, cfg.CompressionSize)
 	str.RaftLogLevel = cfg.RaftLogLevel
+	str.RaftLogger = cfg.HcLogger
 	str.NoFreeListSync = cfg.RaftNoFreelistSync
 	str.ShutdownOnRemove = cfg.RaftShutdownOnRemove
 	str.SnapshotThreshold = cfg.RaftSnapThreshold
@@ -194,7 +211,7 @@ func createDiscoService(cfg *Config, str *store.Store) (*disco.Service, error) {
 	rc = cfg.DiscoConfigReader()
 	defer func() {
 		if rc != nil {
-			rc.Close()
+			_ = rc.Close()
 		}
 	}()
 	if cfg.DiscoMode == DiscoModeConsulKV {
@@ -235,6 +252,7 @@ func startHTTPService(cfg *Config, str *store.Store, cltr *cluster.Client, credS
 		s = httpd.New(cfg.HTTPAddr, str, cltr, nil)
 	}
 
+	adaptLogger(cfg, s.Logger())
 	s.CertFile = cfg.X509Cert
 	s.KeyFile = cfg.X509Key
 	s.TLS1011 = cfg.TLS1011
@@ -272,10 +290,19 @@ func startNodeMux(cfg *Config, ln net.Listener) (*tcp.Mux, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create node-to-node mux: %s", err.Error())
 	}
+	adaptLogger(cfg, mux.Logger)
 	mux.InsecureSkipVerify = cfg.NoNodeVerify
 	go mux.Serve()
 
 	return mux, nil
+}
+
+func adaptLogger(cfg *Config, logger *golog.Logger) *golog.Logger {
+	if cfg.LoggerOutput != nil {
+		logger.SetOutput(cfg.LoggerOutput)
+		logger.SetFlags(0)
+	}
+	return logger
 }
 
 func credentialStore(cfg *Config) (*auth.CredentialsStore, error) {
@@ -289,14 +316,15 @@ func credentialStore(cfg *Config) (*auth.CredentialsStore, error) {
 	}
 
 	cs := auth.NewCredentialsStore()
-	if cs.Load(f); err != nil {
-		return nil, err
+	if err = cs.Load(f); err != nil {
+		return nil, fmt.Errorf("failed to load credential store: %s", err.Error())
 	}
 	return cs, nil
 }
 
 func clusterService(cfg *Config, tn cluster.Transport, db cluster.Database) (*cluster.Service, error) {
 	c := cluster.New(tn, db)
+	adaptLogger(cfg, c.Logger())
 	c.SetAPIAddr(cfg.HTTPAdv)
 	c.EnableHTTPS(cfg.X509Cert != "" && cfg.X509Key != "") // Conditions met for an HTTPS API
 
@@ -306,29 +334,38 @@ func clusterService(cfg *Config, tn cluster.Transport, db cluster.Database) (*cl
 	return c, nil
 }
 
-func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store.Store,
-	httpServ *httpd.Service, credStr *auth.CredentialsStore) error {
+func createCluster(
+	cfg *Config,
+	tlsConfig *tls.Config,
+	hasPeers bool,
+	str *store.Store,
+	httpServ *httpd.Service,
+	credStr *auth.CredentialsStore) (func() error, error) {
+
+	noop := func() error { return nil }
+
 	joins := cfg.JoinAddresses()
 	if joins == nil && cfg.DiscoMode == "" && !hasPeers {
 		// Brand new node, told to bootstrap itself. So do it.
 		log.Println("bootstraping single new node")
 		if err := str.Bootstrap(store.NewServer(str.ID(), cfg.RaftAdv, true)); err != nil {
-			return fmt.Errorf("failed to bootstrap single new node: %s", err.Error())
+			return noop, fmt.Errorf("failed to bootstrap single new node: %s", err.Error())
 		}
-		return nil
+		return noop, nil
 	}
 
 	// Prepare the Joiner
 	joiner := cluster.NewJoiner(cfg.JoinSrcIP, cfg.JoinAttempts, cfg.JoinInterval, tlsConfig)
+	adaptLogger(cfg, joiner.Logger())
 	if cfg.JoinAs != "" {
 		pw, ok := credStr.Password(cfg.JoinAs)
 		if !ok {
-			return fmt.Errorf("user %s does not exist in credential store", cfg.JoinAs)
+			return noop, fmt.Errorf("user %s does not exist in credential store", cfg.JoinAs)
 		}
 		joiner.SetBasicAuth(cfg.JoinAs, pw)
 	}
 
-	// Prepare defintion of being part of a cluster.
+	// Prepare definition of being part of a cluster.
 	isClustered := func() bool {
 		leader, _ := str.LeaderAddr()
 		return leader != ""
@@ -338,35 +375,40 @@ func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store
 		// Explicit join operation requested, so do it.
 		j, err := joiner.Do(joins, str.ID(), cfg.RaftAdv, !cfg.RaftNonVoter)
 		if err != nil {
-			return fmt.Errorf("failed to join cluster: %s", err.Error())
+			return noop, fmt.Errorf("failed to join cluster: %s", err.Error())
 		}
 		log.Println("successfully joined cluster at", j)
-		return nil
+		return noop, nil
 	}
 
 	if joins != nil && cfg.BootstrapExpect > 0 {
 		// Bootstrap with explicit join addresses requests.
 		if hasPeers {
 			log.Println("preexisting node configuration detected, ignoring bootstrap request")
-			return nil
+			return noop, nil
 		}
 
-		bs := cluster.NewBootstrapper(cluster.NewAddressProviderString(joins),
-			cfg.BootstrapExpect, tlsConfig)
+		bs := cluster.NewBootstrapper(cluster.NewAddressProviderString(joins), cfg.BootstrapExpect, tlsConfig)
+		adaptLogger(cfg, bs.Logger())
+		adaptLogger(cfg, bs.JoinerLogger())
+		bs.Interval = cfg.BootstrapRetryInterval
+		bs.MaxInterval = cfg.BootstrapRetryMaxInterval
 		if cfg.JoinAs != "" {
 			pw, ok := credStr.Password(cfg.JoinAs)
 			if !ok {
-				return fmt.Errorf("user %s does not exist in credential store", cfg.JoinAs)
+				return noop, fmt.Errorf("user %s does not exist in credential store", cfg.JoinAs)
 			}
 			bs.SetBasicAuth(cfg.JoinAs, pw)
 		}
-		return bs.Boot(str.ID(), cfg.RaftAdv, isClustered, cfg.BootstrapExpectTimeout)
+		return func() error {
+			return bs.Boot(str.ID(), cfg.RaftAdv, isClustered, cfg.BootstrapExpectTimeout)
+		}, nil
 	}
 
 	if cfg.DiscoMode == "" {
 		// No more clustering techniques to try. Node will just sit, probably using
 		// existing Raft state.
-		return nil
+		return noop, nil
 	}
 
 	log.Printf("discovery mode: %s", cfg.DiscoMode)
@@ -374,12 +416,12 @@ func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store
 	case DiscoModeDNS, DiscoModeDNSSRV:
 		if hasPeers {
 			log.Printf("preexisting node configuration detected, ignoring %s", cfg.DiscoMode)
-			return nil
+			return noop, nil
 		}
 		rc := cfg.DiscoConfigReader()
 		defer func() {
 			if rc != nil {
-				rc.Close()
+				_ = rc.Close()
 			}
 		}()
 
@@ -390,33 +432,41 @@ func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store
 		if cfg.DiscoMode == DiscoModeDNS {
 			dnsCfg, err := dns.NewConfigFromReader(rc)
 			if err != nil {
-				return fmt.Errorf("error reading DNS configuration: %s", err.Error())
+				return noop, fmt.Errorf("error reading DNS configuration: %s", err.Error())
 			}
 			provider = dns.New(dnsCfg)
 
 		} else {
 			dnssrvCfg, err := dnssrv.NewConfigFromReader(rc)
 			if err != nil {
-				return fmt.Errorf("error reading DNS configuration: %s", err.Error())
+				return noop, fmt.Errorf("error reading DNS configuration: %s", err.Error())
 			}
 			provider = dnssrv.New(dnssrvCfg)
 		}
 
 		bs := cluster.NewBootstrapper(provider, cfg.BootstrapExpect, tlsConfig)
+		adaptLogger(cfg, bs.Logger())
+		bs.Interval = cfg.BootstrapRetryInterval
+		bs.MaxInterval = cfg.BootstrapRetryMaxInterval
 		if cfg.JoinAs != "" {
 			pw, ok := credStr.Password(cfg.JoinAs)
 			if !ok {
-				return fmt.Errorf("user %s does not exist in credential store", cfg.JoinAs)
+				return noop, fmt.Errorf("user %s does not exist in credential store", cfg.JoinAs)
 			}
 			bs.SetBasicAuth(cfg.JoinAs, pw)
 		}
-		httpServ.RegisterStatus("disco", provider)
-		return bs.Boot(str.ID(), cfg.RaftAdv, isClustered, cfg.BootstrapExpectTimeout)
+		err := httpServ.RegisterStatus("disco", provider)
+		if err != nil {
+			return noop, fmt.Errorf("failed to register status provider 'disco': %s", err.Error())
+		}
+		return func() error {
+			return bs.Boot(str.ID(), cfg.RaftAdv, isClustered, cfg.BootstrapExpectTimeout)
+		}, nil
 
 	case DiscoModeEtcdKV, DiscoModeConsulKV:
 		discoService, err := createDiscoService(cfg, str)
 		if err != nil {
-			return fmt.Errorf("failed to start discovery service: %s", err.Error())
+			return noop, fmt.Errorf("failed to start discovery service: %s", err.Error())
 		}
 
 		if !hasPeers {
@@ -424,12 +474,12 @@ func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store
 
 			leader, addr, err := discoService.Register(str.ID(), cfg.HTTPURL(), cfg.RaftAdv)
 			if err != nil {
-				return fmt.Errorf("failed to register with discovery service: %s", err.Error())
+				return noop, fmt.Errorf("failed to register with discovery service: %s", err.Error())
 			}
 			if leader {
 				log.Println("node registered as leader using discovery service")
-				if err := str.Bootstrap(store.NewServer(str.ID(), str.Addr(), true)); err != nil {
-					return fmt.Errorf("failed to bootstrap single new node: %s", err.Error())
+				if err = str.Bootstrap(store.NewServer(str.ID(), str.Addr(), true)); err != nil {
+					return noop, fmt.Errorf("failed to bootstrap single new node: %s", err.Error())
 				}
 			} else {
 				for {
@@ -456,7 +506,7 @@ func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store
 		httpServ.RegisterStatus("disco", discoService)
 
 	default:
-		return fmt.Errorf("invalid disco mode %s", cfg.DiscoMode)
+		return noop, fmt.Errorf("invalid disco mode %s", cfg.DiscoMode)
 	}
-	return nil
+	return noop, nil
 }

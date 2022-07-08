@@ -43,24 +43,34 @@ type Bootstrapper struct {
 	username string
 	password string
 
-	logger   *log.Logger
-	Interval time.Duration
+	logger      *log.Logger
+	Interval    time.Duration
+	MaxInterval time.Duration
 }
 
 // NewBootstrapper returns an instance of a Bootstrapper.
 func NewBootstrapper(p AddressProvider, expect int, tlsConfig *tls.Config) *Bootstrapper {
 	bs := &Bootstrapper{
-		provider:  p,
-		expect:    expect,
-		tlsConfig: &tls.Config{InsecureSkipVerify: true},
-		joiner:    NewJoiner("", 1, 0, tlsConfig),
-		logger:    log.New(os.Stderr, "[cluster-bootstrap] ", log.LstdFlags),
-		Interval:  jitter(5 * time.Second),
+		provider:    p,
+		expect:      expect,
+		tlsConfig:   &tls.Config{InsecureSkipVerify: true},
+		joiner:      NewJoiner("", 1, 0, tlsConfig),
+		logger:      log.New(os.Stderr, "[cluster-bootstrap] ", log.LstdFlags),
+		Interval:    5 * time.Second,
+		MaxInterval: 1 * time.Minute,
 	}
 	if tlsConfig != nil {
 		bs.tlsConfig = tlsConfig
 	}
 	return bs
+}
+
+func (b *Bootstrapper) Logger() *log.Logger {
+	return b.logger
+}
+
+func (b *Bootstrapper) JoinerLogger() *log.Logger {
+	return b.joiner.logger
 }
 
 // SetBasicAuth sets Basic Auth credentials for any bootstrap attempt.
@@ -84,9 +94,10 @@ func (b *Bootstrapper) SetBasicAuth(username, password string) {
 func (b *Bootstrapper) Boot(id, raftAddr string, done func() bool, timeout time.Duration) error {
 	timeoutT := time.NewTimer(timeout)
 	defer timeoutT.Stop()
-	tickerT := time.NewTimer(jitter(time.Millisecond))
+	tickerT := time.NewTimer(time.Millisecond)
 	defer tickerT.Stop()
 
+	interval := b.Interval
 	notifySuccess := false
 	for {
 		select {
@@ -98,7 +109,13 @@ func (b *Bootstrapper) Boot(id, raftAddr string, done func() bool, timeout time.
 				b.logger.Printf("boot operation marked done")
 				return nil
 			}
-			tickerT.Reset(jitter(b.Interval)) // Move to longer-period polling
+
+			if interval < b.MaxInterval {
+				interval = interval + time.Duration(rand.Float64()*float64(interval)/2)
+			} else {
+				interval = b.Interval + time.Duration(rand.Float64()*float64(b.Interval)/2)
+			}
+			tickerT.Reset(interval) // Move to longer-period polling
 
 			targets, err := b.provider.Lookup()
 			if err != nil {
@@ -198,11 +215,4 @@ func (s *stringAddressProvider) Lookup() ([]string, error) {
 // NewAddressProviderString wraps an AddressProvider around a string slice.
 func NewAddressProviderString(ss []string) AddressProvider {
 	return &stringAddressProvider{ss}
-}
-
-// jitter adds a little bit of randomness to a given duration. This is
-// useful to prevent nodes across the cluster performing certain operations
-// all at the same time.
-func jitter(duration time.Duration) time.Duration {
-	return duration + time.Duration(rand.Float64()*float64(duration))
 }

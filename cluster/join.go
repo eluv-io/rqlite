@@ -85,6 +85,10 @@ func NewJoiner(srcIP string, numAttempts int, attemptInterval time.Duration,
 	return joiner
 }
 
+func (j *Joiner) Logger() *log.Logger {
+	return j.logger
+}
+
 // SetBasicAuth sets Basic Auth credentials for any join attempt.
 func (j *Joiner) SetBasicAuth(username, password string) {
 	j.username, j.password = username, password

@@ -93,6 +93,10 @@ func New(tn Transport, db Database) *Service {
 	}
 }
 
+func (s *Service) Logger() *log.Logger {
+	return s.logger
+}
+
 // Open opens the Service.
 func (s *Service) Open() error {
 	go s.serve()

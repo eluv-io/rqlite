@@ -10,6 +10,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/hashicorp/go-hclog"
 )
 
 const (
@@ -23,35 +25,40 @@ const (
 // DefaultConfig returns the default rqlite configuration.
 func DefaultConfig() Config {
 	return Config{
-		HTTPAddr:               "localhost:4001",
-		NodeX509Cert:           "cert.pem",
-		NodeX509Key:            "key.pem",
-		RaftAddr:               "localhost:4002",
-		JoinAttempts:           5,
-		JoinInterval:           3,
-		BootstrapExpect:        0,
-		BootstrapExpectTimeout: 120,
-		DiscoKey:               "rqlite",
-		Expvar:                 true,
-		RaftHeartbeatTimeout:   time.Second,
-		RaftElectionTimeout:    time.Second,
-		RaftApplyTimeout:       10 * time.Second,
-		RaftSnapThreshold:      8192,
-		RaftSnapInterval:       30 * time.Second,
-		RaftLogLevel:           "INFO",
-		ClusterConnectTimeout:  30 * time.Second,
-		WriteQueueCap:          128,
-		WriteQueueBatchSz:      16,
-		WriteQueueTimeout:      50 * time.Millisecond,
-		CompressionSize:        150,
-		CompressionBatch:       5,
+		HTTPAddr:                  "localhost:4001",
+		NodeX509Cert:              "cert.pem",
+		NodeX509Key:               "key.pem",
+		RaftAddr:                  "localhost:4002",
+		JoinAttempts:              5,
+		JoinInterval:              3 * time.Second,
+		BootstrapExpect:           0,
+		BootstrapExpectTimeout:    120 * time.Second,
+		BootstrapRetryInterval:    1 * time.Second,
+		BootstrapRetryMaxInterval: 10 * time.Second,
+		DiscoKey:                  "rqlite",
+		Expvar:                    true,
+		RaftHeartbeatTimeout:      time.Second,
+		RaftElectionTimeout:       time.Second,
+		RaftApplyTimeout:          10 * time.Second,
+		RaftSnapThreshold:         8192,
+		RaftSnapInterval:          30 * time.Second,
+		RaftLogLevel:              "INFO",
+		ClusterConnectTimeout:     30 * time.Second,
+		WriteQueueCap:             128,
+		WriteQueueBatchSz:         16,
+		WriteQueueTimeout:         50 * time.Millisecond,
+		CompressionSize:           150,
+		CompressionBatch:          5,
 	}
 }
 
 // Config represents the configuration as set by command-line flags.
 // All variables will be set, unless explicit noted.
 type Config struct {
-	// DataPath is path to node data. Always set.
+	LoggerOutput io.Writer
+	HcLogger     hclog.Logger
+
+	// DataPath is path to node data. Has to be always set.
 	DataPath string
 
 	// HTTPAddr is the bind network address for the HTTP Server.
@@ -123,6 +130,14 @@ type Config struct {
 
 	// BootstrapExpectTimeout is the maximum time a bootstrap operation can take.
 	BootstrapExpectTimeout time.Duration
+
+	// BootstrapRetryInterval is the retry interval between bootstrap attempts.
+	// The interval is gets exponentially increased (including some jitter)
+	// until it reaches BootstrapMaxRetryInterval.
+	BootstrapRetryInterval time.Duration
+
+	// BootstrapRetryMaxInterval is the maximum retry interval - see BootstrapRetryInterval.
+	BootstrapRetryMaxInterval time.Duration
 
 	// NoHTTPVerify disables checking other nodes' HTTP X509 certs for validity.
 	NoHTTPVerify bool

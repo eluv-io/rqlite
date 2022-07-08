@@ -22,6 +22,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/rqlite/rqlite/v7/command"
 	sql "github.com/rqlite/rqlite/v7/db"
@@ -202,6 +203,7 @@ type Store struct {
 	ElectionTimeout    time.Duration
 	ApplyTimeout       time.Duration
 	RaftLogLevel       string
+	RaftLogger         hclog.Logger
 	NoFreeListSync     bool
 
 	numTrailingLogs uint64
@@ -295,7 +297,7 @@ func (s *Store) Open() (retErr error) {
 	}
 
 	// Create Raft-compatible network layer.
-	s.raftTn = raft.NewNetworkTransport(NewTransport(s.ln), connectionPoolCount, connectionTimeout, nil)
+	s.raftTn = raft.NewNetworkTransportWithLogger(NewTransport(s.ln), connectionPoolCount, connectionTimeout, s.RaftLogger)
 
 	// Don't allow control over trailing logs directly, just implement a policy.
 	s.numTrailingLogs = uint64(float64(s.SnapshotThreshold) * trailingScale)
@@ -304,7 +306,7 @@ func (s *Store) Open() (retErr error) {
 	config.LocalID = raft.ServerID(s.raftID)
 
 	// Create the snapshot store. This allows Raft to truncate the log.
-	snapshots, err := raft.NewFileSnapshotStore(s.raftDir, retainSnapshotCount, os.Stderr)
+	snapshots, err := raft.NewFileSnapshotStoreWithLogger(s.raftDir, retainSnapshotCount, s.RaftLogger)
 	if err != nil {
 		return fmt.Errorf("file snapshot store: %s", err)
 	}
@@ -1064,6 +1066,7 @@ func (s *Store) raftConfig() *raft.Config {
 	config := raft.DefaultConfig()
 	config.ShutdownOnRemove = s.ShutdownOnRemove
 	config.LogLevel = s.RaftLogLevel
+	config.Logger = s.RaftLogger
 	if s.SnapshotThreshold != 0 {
 		config.SnapshotThreshold = s.SnapshotThreshold
 		config.TrailingLogs = s.numTrailingLogs
