@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rqlite/rqlite/command"
+	"github.com/rqlite/rqlite/v7/command"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -91,6 +91,10 @@ func New(tn Transport, db Database) *Service {
 		db:     db,
 		logger: log.New(os.Stderr, "[cluster] ", log.LstdFlags),
 	}
+}
+
+func (s *Service) Logger() *log.Logger {
+	return s.logger
 }
 
 // Open opens the Service.

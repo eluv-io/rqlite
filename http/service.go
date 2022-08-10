@@ -22,11 +22,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rqlite/rqlite/auth"
-	"github.com/rqlite/rqlite/command"
-	"github.com/rqlite/rqlite/command/encoding"
-	"github.com/rqlite/rqlite/queue"
-	"github.com/rqlite/rqlite/store"
+	"github.com/rqlite/rqlite/v7/auth"
+	"github.com/rqlite/rqlite/v7/command"
+	"github.com/rqlite/rqlite/v7/command/encoding"
+	"github.com/rqlite/rqlite/v7/queue"
+	"github.com/rqlite/rqlite/v7/store"
 )
 
 var (
@@ -291,6 +291,10 @@ func New(addr string, store Store, cluster Cluster, credentials CredentialStore)
 		credentialStore:     credentials,
 		logger:              log.New(os.Stderr, "[http] ", log.LstdFlags),
 	}
+}
+
+func (s *Service) Logger() *log.Logger {
+	return s.logger
 }
 
 // Start starts the service.

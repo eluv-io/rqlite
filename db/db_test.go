@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rqlite/rqlite/command"
-	"github.com/rqlite/rqlite/command/encoding"
-	"github.com/rqlite/rqlite/db/testdata"
-	"github.com/rqlite/rqlite/testdata/chinook"
+	"github.com/rqlite/rqlite/v7/command"
+	"github.com/rqlite/rqlite/v7/command/encoding"
+	"github.com/rqlite/rqlite/v7/db/testdata"
+	"github.com/rqlite/rqlite/v7/testdata/chinook"
 )
 
 /*

@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	httpd "github.com/rqlite/rqlite/http"
+	httpd "github.com/rqlite/rqlite/v7/http"
 )
 
 var (
@@ -83,6 +83,10 @@ func NewJoiner(srcIP string, numAttempts int, attemptInterval time.Duration,
 	}
 
 	return joiner
+}
+
+func (j *Joiner) Logger() *log.Logger {
+	return j.logger
 }
 
 // SetBasicAuth sets Basic Auth credentials for any join attempt.

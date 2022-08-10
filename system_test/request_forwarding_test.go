@@ -4,9 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rqlite/rqlite/cluster"
-	"github.com/rqlite/rqlite/command"
-	"github.com/rqlite/rqlite/tcp"
+	"github.com/rqlite/rqlite/v7/cluster"
+	"github.com/rqlite/rqlite/v7/command"
+	"github.com/rqlite/rqlite/v7/tcp"
 )
 
 const shortWait = 5 * time.Second

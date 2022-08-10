@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rqlite/rqlite/testdata/x509"
+	"github.com/rqlite/rqlite/v7/testdata/x509"
 )
 
 func Test_NewDialer(t *testing.T) {

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rqlite/rqlite/cluster"
-	"github.com/rqlite/rqlite/tcp"
+	"github.com/rqlite/rqlite/v7/cluster"
+	"github.com/rqlite/rqlite/v7/tcp"
 )
 
 // Test_JoinLeaderNode tests a join operation between a leader and a new node.

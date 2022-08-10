@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rqlite/rqlite/command"
+	"github.com/rqlite/rqlite/v7/command"
 )
 
 // FlushChannel is the type passed to the Queue, if caller wants

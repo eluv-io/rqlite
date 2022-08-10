@@ -3,7 +3,7 @@ package encoding
 import (
 	"testing"
 
-	"github.com/rqlite/rqlite/command"
+	"github.com/rqlite/rqlite/v7/command"
 )
 
 func Test_JSONNoEscaping(t *testing.T) {
