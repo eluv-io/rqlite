@@ -7,7 +7,7 @@ require (
 	github.com/armon/go-metrics v0.4.0 // indirect
 	github.com/fatih/color v1.13.0 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
-	github.com/hashicorp/go-hclog v1.2.0 // indirect
+	github.com/hashicorp/go-hclog v1.2.0
 	github.com/hashicorp/go-immutable-radix v1.3.1 // indirect
 	github.com/hashicorp/go-msgpack v1.1.5 // indirect
 	github.com/hashicorp/golang-lru v0.5.4 // indirect
@@ -16,11 +16,11 @@ require (
 	github.com/hashicorp/serf v0.9.8 // indirect
 	github.com/labstack/gommon v0.3.1 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
+	github.com/mattn/go-sqlite3 v0.0.0-00010101000000-000000000000
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/mkideal/cli v0.2.7
 	github.com/mkideal/pkg v0.1.3
 	github.com/pkg/errors v0.9.1
-	github.com/rqlite/go-sqlite3 v1.25.0
 	github.com/rqlite/raft-boltdb v0.0.0-20211018013422-771de01086ce
 	github.com/rqlite/rqlite-disco-clients v0.0.0-20220328160918-ec33ecd01491
 	github.com/stretchr/testify v1.7.0
@@ -35,3 +35,5 @@ require (
 	google.golang.org/genproto v0.0.0-20220526192754-51939a95c655 // indirect
 	google.golang.org/protobuf v1.28.0
 )
+
+replace github.com/mattn/go-sqlite3 => github.com/rqlite/go-sqlite3 v1.25.0
