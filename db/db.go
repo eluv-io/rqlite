@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rqlite/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
 	"github.com/rqlite/rqlite/v7/command"
 )
 
