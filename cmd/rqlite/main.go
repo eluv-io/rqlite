@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -13,11 +14,13 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Bowery/prompt"
 	"github.com/mkideal/cli"
 	"github.com/rqlite/rqlite/v7/cmd"
+	"github.com/rqlite/rqlite/v7/cmd/rqlite/history"
 	httpcl "github.com/rqlite/rqlite/v7/cmd/rqlite/http"
 )
 
@@ -40,6 +43,7 @@ var cliHelp = []string{
 	`.backup <file>                      Write database backup to SQLite file`,
 	`.consistency [none|weak|strong]     Show or set read consistency level`,
 	`.dump <file>                        Dump the database in SQL text format to a file`,
+	`.exit                               Exit this program`,
 	`.expvar                             Show expvar (Go runtime) information for connected node`,
 	`.help                               Show this message`,
 	`.indexes                            Show names of all indexes`,
@@ -77,7 +81,12 @@ func main() {
 
 		version, err := getVersionWithClient(httpClient, argv)
 		if err != nil {
-			ctx.String("%s %v\n", ctx.Color().Red("ERR!"), err)
+			msg := err.Error()
+			if errors.Is(err, syscall.ECONNREFUSED) {
+				msg = fmt.Sprintf("Unable to connect to rqlited at %s://%s:%d - is it running?",
+					argv.Protocol, argv.Host, argv.Port)
+			}
+			ctx.String("%s %v\n", ctx.Color().Red("ERR!"), msg)
 			return nil
 		}
 
@@ -95,6 +104,16 @@ func main() {
 		}
 		term.Close()
 
+		// Set up command history.
+		hr := history.Reader()
+		if hr != nil {
+			histCmds, err := history.Read(hr)
+			if err == nil {
+				term.History = histCmds
+			}
+			hr.Close()
+		}
+
 		hosts := createHostList(argv)
 		client := httpcl.NewClient(httpClient, hosts,
 			httpcl.WithScheme(argv.Protocol),
@@ -107,6 +126,9 @@ func main() {
 			line, err := term.Basic(prefix, false)
 			term.Close()
 			if err != nil {
+				if errors.Is(err, prompt.ErrEOF) {
+					break FOR_READ
+				}
 				return err
 			}
 
@@ -173,7 +195,7 @@ func main() {
 				err = dump(ctx, line[index+1:], argv)
 			case ".HELP":
 				err = help(ctx, cmd, line, argv)
-			case ".QUIT", "QUIT", "EXIT":
+			case ".QUIT", "QUIT", "EXIT", ".EXIT":
 				break FOR_READ
 			case "SELECT", "PRAGMA":
 				err = queryWithClient(ctx, client, timer, consistency, line)
@@ -189,6 +211,14 @@ func main() {
 					ctx.String("%s %v\n", ctx.Color().Red("ERR!"), err)
 				}
 			}
+		}
+
+		hw := history.Writer()
+		sz := history.Size()
+		history.Write(term.History, sz, hw)
+		hw.Close()
+		if sz <= 0 {
+			history.Delete()
 		}
 		ctx.String("bye~\n")
 		return nil

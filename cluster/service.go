@@ -1,6 +1,8 @@
 package cluster
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/binary"
 	"expvar"
 	"fmt"
@@ -12,7 +14,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rqlite/rqlite/v7/auth"
 	"github.com/rqlite/rqlite/v7/command"
+
 	"google.golang.org/protobuf/proto"
 )
 
@@ -24,6 +28,9 @@ const (
 	numGetNodeAPIResponse = "num_get_node_api_resp"
 	numExecuteRequest     = "num_execute_req"
 	numQueryRequest       = "num_query_req"
+	numBackupRequest      = "num_backup_req"
+	numLoadRequest        = "num_load_req"
+	numRemoveNodeRequest  = "num_remove_node_req"
 
 	// Client stats for this package.
 	numGetNodeAPIRequestLocal = "num_get_node_api_req_local"
@@ -43,6 +50,9 @@ func init() {
 	stats.Add(numGetNodeAPIResponse, 0)
 	stats.Add(numExecuteRequest, 0)
 	stats.Add(numQueryRequest, 0)
+	stats.Add(numBackupRequest, 0)
+	stats.Add(numLoadRequest, 0)
+	stats.Add(numRemoveNodeRequest, 0)
 	stats.Add(numGetNodeAPIRequestLocal, 0)
 }
 
@@ -61,6 +71,24 @@ type Database interface {
 
 	// Query executes a slice of queries, each of which returns rows.
 	Query(qr *command.QueryRequest) ([]*command.QueryRows, error)
+
+	// Backup writes a backup of the database to the writer.
+	Backup(br *command.BackupRequest, dst io.Writer) error
+
+	// Loads an entire SQLite file into the database
+	Load(lr *command.LoadRequest) error
+}
+
+// Manager is the interface node-management systems must implement
+type Manager interface {
+	// Remove removes the node, given by id, from the cluster
+	Remove(rn *command.RemoveNodeRequest) error
+}
+
+// CredentialStore is the interface credential stores must support.
+type CredentialStore interface {
+	// AA authenticates and checks authorization for the given perm.
+	AA(username, password, perm string) bool
 }
 
 // Transport is the interface the network layer must provide.
@@ -74,7 +102,10 @@ type Service struct {
 	tn   Transport // Network layer this service uses
 	addr net.Addr  // Address on which this service is listening
 
-	db Database // The queryable system.
+	db  Database // The queryable system.
+	mgr Manager  // The cluster management system.
+
+	credentialStore CredentialStore
 
 	mu      sync.RWMutex
 	https   bool   // Serving HTTPS?
@@ -84,12 +115,14 @@ type Service struct {
 }
 
 // New returns a new instance of the cluster service
-func New(tn Transport, db Database) *Service {
+func New(tn Transport, db Database, m Manager, credentialStore CredentialStore) *Service {
 	return &Service{
-		tn:     tn,
-		addr:   tn.Addr(),
-		db:     db,
-		logger: log.New(os.Stderr, "[cluster] ", log.LstdFlags),
+		tn:              tn,
+		addr:            tn.Addr(),
+		db:              db,
+		mgr:             m,
+		logger:          log.New(os.Stderr, "[cluster] ", log.LstdFlags),
+		credentialStore: credentialStore,
 	}
 }
 
@@ -171,16 +204,30 @@ func (s *Service) serve() error {
 	}
 }
 
+func (s *Service) checkCommandPerm(c *Command, perm string) bool {
+	if s.credentialStore == nil {
+		return true
+	}
+
+	username := ""
+	password := ""
+	if c.Credentials != nil {
+		username = c.Credentials.GetUsername()
+		password = c.Credentials.GetPassword()
+	}
+	return s.credentialStore.AA(username, password, perm)
+}
+
 func (s *Service) handleConn(conn net.Conn) {
 	defer conn.Close()
 
 	for {
-		b := make([]byte, 4)
+		b := make([]byte, protoBufferLengthSize)
 		_, err := io.ReadFull(conn, b)
 		if err != nil {
 			return
 		}
-		sz := binary.LittleEndian.Uint16(b[0:])
+		sz := binary.LittleEndian.Uint64(b[0:])
 
 		p := make([]byte, sz)
 		_, err = io.ReadFull(conn, p)
@@ -203,22 +250,18 @@ func (s *Service) handleConn(conn net.Conn) {
 			if err != nil {
 				conn.Close()
 			}
-
-			// Write length of Protobuf first, then write the actual Protobuf.
-			b = make([]byte, 4)
-			binary.LittleEndian.PutUint16(b[0:], uint16(len(p)))
-			conn.Write(b)
-			conn.Write(p)
+			writeBytesWithLength(conn, p)
 			stats.Add(numGetNodeAPIResponse, 1)
 
 		case Command_COMMAND_TYPE_EXECUTE:
 			stats.Add(numExecuteRequest, 1)
 
 			resp := &CommandExecuteResponse{}
-
 			er := c.GetExecuteRequest()
 			if er == nil {
 				resp.Error = "ExecuteRequest is nil"
+			} else if !s.checkCommandPerm(c, auth.PermExecute) {
+				resp.Error = "unauthorized"
 			} else {
 				res, err := s.db.Execute(er)
 				if err != nil {
@@ -235,11 +278,7 @@ func (s *Service) handleConn(conn net.Conn) {
 			if err != nil {
 				return
 			}
-			// Write length of Protobuf first, then write the actual Protobuf.
-			b = make([]byte, 4)
-			binary.LittleEndian.PutUint32(b[0:], uint32(len(p)))
-			conn.Write(b)
-			conn.Write(p)
+			writeBytesWithLength(conn, p)
 
 		case Command_COMMAND_TYPE_QUERY:
 			stats.Add(numQueryRequest, 1)
@@ -249,6 +288,8 @@ func (s *Service) handleConn(conn net.Conn) {
 			qr := c.GetQueryRequest()
 			if qr == nil {
 				resp.Error = "QueryRequest is nil"
+			} else if !s.checkCommandPerm(c, auth.PermQuery) {
+				resp.Error = "unauthorized"
 			} else {
 				res, err := s.db.Query(qr)
 				if err != nil {
@@ -265,11 +306,106 @@ func (s *Service) handleConn(conn net.Conn) {
 			if err != nil {
 				return
 			}
-			// Write length of Protobuf first, then write the actual Protobuf.
-			b = make([]byte, 4)
-			binary.LittleEndian.PutUint32(b[0:], uint32(len(p)))
-			conn.Write(b)
-			conn.Write(p)
+			writeBytesWithLength(conn, p)
+
+		case Command_COMMAND_TYPE_BACKUP:
+			stats.Add(numBackupRequest, 1)
+
+			resp := &CommandBackupResponse{}
+
+			br := c.GetBackupRequest()
+			if br == nil {
+				resp.Error = "BackupRequest is nil"
+			} else if !s.checkCommandPerm(c, auth.PermBackup) {
+				resp.Error = "unauthorized"
+			} else {
+				buf := new(bytes.Buffer)
+				if err := s.db.Backup(br, buf); err != nil {
+					resp.Error = err.Error()
+				} else {
+					resp.Data = buf.Bytes()
+				}
+			}
+			p, err = proto.Marshal(resp)
+			if err != nil {
+				conn.Close()
+				return
+			}
+
+			// Compress the backup for less space on the wire between nodes.
+			p, err = gzCompress(p)
+			if err != nil {
+				conn.Close()
+				return
+			}
+			writeBytesWithLength(conn, p)
+
+		case Command_COMMAND_TYPE_LOAD:
+			stats.Add(numLoadRequest, 1)
+
+			resp := &CommandLoadResponse{}
+
+			lr := c.GetLoadRequest()
+			if lr == nil {
+				resp.Error = "LoadRequest is nil"
+			} else if !s.checkCommandPerm(c, auth.PermLoad) {
+				resp.Error = "unauthorized"
+			} else {
+				if err := s.db.Load(lr); err != nil {
+					resp.Error = fmt.Sprintf("remote node failed to load: %s", err.Error())
+				}
+			}
+
+			p, err = proto.Marshal(resp)
+			if err != nil {
+				return
+			}
+			writeBytesWithLength(conn, p)
+
+		case Command_COMMAND_TYPE_REMOVE_NODE:
+			stats.Add(numRemoveNodeRequest, 1)
+			resp := &CommandRemoveNodeResponse{}
+
+			rn := c.GetRemoveNodeRequest()
+			if rn == nil {
+				resp.Error = "LoadRequest is nil"
+			} else if !s.checkCommandPerm(c, auth.PermRemove) {
+				resp.Error = "unauthorized"
+			} else {
+				if err := s.mgr.Remove(rn); err != nil {
+					resp.Error = err.Error()
+				}
+			}
+
+			p, err = proto.Marshal(resp)
+			if err != nil {
+				conn.Close()
+			}
+			writeBytesWithLength(conn, p)
 		}
 	}
+}
+
+func writeBytesWithLength(conn net.Conn, p []byte) {
+	b := make([]byte, protoBufferLengthSize)
+	binary.LittleEndian.PutUint64(b[0:], uint64(len(p)))
+	conn.Write(b)
+	conn.Write(p)
+}
+
+// gzCompress compresses the given byte slice.
+func gzCompress(b []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	gzw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if err != nil {
+		return nil, fmt.Errorf("gzip new writer: %s", err)
+	}
+
+	if _, err := gzw.Write(b); err != nil {
+		return nil, fmt.Errorf("gzip Write: %s", err)
+	}
+	if err := gzw.Close(); err != nil {
+		return nil, fmt.Errorf("gzip Close: %s", err)
+	}
+	return buf.Bytes(), nil
 }

@@ -1,4 +1,6 @@
 # Contents
+> :warning: **This page is no longer maintained. Visit [rqlite.io](https://www.rqlite.io) for the latest docs.**
+
 * [General guidelines](#general-guidelines)
 * [Creating a cluster](#creating-a-cluster)
 * [Growing a cluster](#growing-a-cluster)
@@ -10,11 +12,11 @@
 This document describes, in detail, how to create and manage a rqlite cluster.
 
 ## Practical cluster size
-Firstly, you should understand the basic requirement for systems built on the [Raft protocol](https://raft.github.io/). For a cluster of `N` nodes in size to remain operational, at least `(N/2)+1` nodes must be up and running, and be in contact with each other.  
+Firstly, you should understand the basic requirement for systems built on the [Raft protocol](https://raft.github.io/). For a cluster of `N` nodes in size to remain operational, at least `(N/2)+1` nodes must be up and running, and be in contact with each other. For a single-node system (N=1) then (obviously) that single node must be running. For a 3-node cluster (N=3) at least 2 nodes must be running. For N=5, at least 3 nodes should be running, and so on.
 
 Clusters of 3, 5, 7, or 9, nodes are most practical. Clusters of those sizes can tolerate failures of 1, 2, 3, and 4 nodes respectively.
 
-Clusters with a greater number of nodes start to become unwieldy, due to the number of nodes that must be contacted before a database change can take place.
+Clusters with a greater number of nodes start to become unwieldy, due to the number of nodes that must be contacted before a database change can take place. There is no intrinsic limit to the number of nodes comprising a cluster, but the operational overload can increase with little benefit.
 
 ### Read-only nodes
 It is possible to run larger clusters if you just need nodes [from which you only need to read from](https://github.com/rqlite/rqlite/blob/master/DOC/READ_ONLY_NODES.md). When it comes to the Raft protocol, these nodes do not count towards `N`, since they do not [vote](https://raft.github.io/).
@@ -59,14 +61,11 @@ You can set the Node ID (`-node-id`) to anything you wish, as long as it's uniqu
 ## Listening on all interfaces
 You can pass `0.0.0.0` to both `-http-addr` and `-raft-addr` if you wish a node to listen on all interfaces. You must still pass an explicit network address to `-join` however. In this case you'll also want to set `-http-adv-addr` and `-raft-adv-addr` to the actual interface addresses, so other nodes learn the correct network address to use to reach the node listening on `0.0.0.0`.
 
-## Discovery Service
-There is also a rqlite _Discovery Service_, allowing nodes to automatically connect and form a cluster. This can be much more convenient, allowing clusters to be dynamically created. Check out [the documentation](https://github.com/rqlite/rqlite/blob/master/DOC/DISCOVERY.md) for more details.
-
 ## Through the firewall
 On some networks, like AWS EC2 cloud, nodes may have an IP address that is not routable from outside the firewall. Instead these nodes are addressed using a different IP address. You can still form a rqlite cluster however -- check out [this tutorial](https://www.philipotoole.com/rqlite-v3-0-1-globally-replicating-sqlite/) for an example. The key thing is that you must set `-http-adv-addr` and `-raft-adv-addr` so a routable address is broadcast to other nodes.
 
 # Growing a cluster
-You can grow a cluster, at anytime, simply by starting up a new node (pick a never before used node ID) and having it explicitly join with the leader as normal, or by passing it a discovery service ID. The new node will automatically pick up all changes that have occurred on the cluster since the cluster first started. In otherwords, after joining successfully, the new node will have a full copy of the SQLite database, just like every other node in the cluster.
+You can grow a cluster, at anytime, simply by starting up a new node (pick a never before used node ID) and having it explicitly join with the leader as normal. The new node will automatically pick up all changes that have occurred on the cluster since the cluster first started. In otherwords, after joining successfully, the new node will have a full copy of the SQLite database, just like every other node in the cluster.
 
 # Modifying a node's Raft network addresses
 It is possible to change a node's Raft address between restarts. Simply pass the new address on the command line. **You must also, however, explicitly tell the node to join the cluster again, by passing `-join` to the node**. In this case what the leader actually does is remove the previous record of the node, before adding a new record of the node. You can also change the HTTP API address of a node between restarts, but an explicit re-join is not required if just the HTTP API address changes.
@@ -83,38 +82,25 @@ If a node fails completely and is not coming back, or if you shut down a node be
 You can also make a direct call to the HTTP API to remove a node:
 
 ```
-curl -XDELETE http://localhost:4001/remove -d '{"id": "<node raft ID>"}'
+curl -XDELETE http://host:4001/remove -d '{"id": "<node raft ID>"}'
 ```
-assuming `localhost` is the address of the cluster leader. If you do not do this the leader will continually attempt to communicate with that node. **Note that the cluster must be functional -- there must still be an operational leader -- for this removal to be successful**. If, after a node failure, a given cluster does not have a quorum of nodes still running, you must bring back the failed node. Any attempt to remove it will fail as there will be no leader to respond to the failure request.
+where `host` is any node in the cluster. If you do not remove a failed node the lLader will continually attempt to communicate with that node. **Note that the cluster must be functional -- there must still be an operational Leader -- for this removal to be successful**. If, after a node failure, a given cluster does not have a quorum of nodes still running, you must bring back the failed node. Any attempt to remove it will fail as there will be no Leader to respond to the node-removal request.
 
 If you cannot bring sufficient nodes back online such that the cluster can elect a leader, follow the instructions in the section titled _Dealing with failure_.
 
-## Examples
-_Quorum is defined as (N/2)+1 where N is the size of the cluster._
+## Automatically removing failed nodes
+> :warning: **This functionality was introduced in version 7.11.0. It does not exist in earlier releases.**
 
-### 2-node cluster 
-Quorum of a 2-node cluster is 2.
+rqlite supports automatically removing both voting (the default type) and non-voting (read-only) nodes that have been non-reachable for a configurable period of time. A non-reachable node is defined as a node that the Leader cannot heartbeat with. To enable reaping of voting nodes set `-raft-reap-node-timeout` to a non-zero time interval. Likewise, to enable reaping of non-voting (read-only) nodes set `-raft-reap-read-only-node-timeout`.
 
-If 1 node fails, quorum can no longer reached. The failing node must be recovered, as the failed node cannot be removed, and a new node cannot be added to the cluster to takes its place. This is why you shouldn't run 2-node clusters, except for testing purposes. In general it doesn't make much sense to run clusters with even-number of nodes at all.
+It is recommended that these values be set conservatively, especially for voting nodes. Setting them too low may mean you don't account for the normal kinds of network outages and tempoary failures that can affect distributed systems such as rqlite. Note that the timeout clock is reset if a cluster elects a new Leader.
 
-If you remove a single node from a fully-functional 2-node cluster, quorum will be reduced to 1 since you will be left with a 1-node cluster.
-
-### 3-node cluster
-Quorum of a 3-node cluster is 2.
-
-If 1 node fails, the cluster can still reach quorum. Remove the failing node, or restart it. If you remove the node, quorum remains at 2. You should add a new node to get the cluster back to 3 nodes in size. If 2 nodes fail, the cluster will not be able to reach quorum. You must instead restart at least one of the nodes.
-
-If you remove a single node from a fully-functional 3-node cluster, quorum will be unchanged since you now have a 2-node cluster.
-
-### 4-node cluster
-Quorum of a 4-node cluster is 3.
-
-The situation is similar for a 3-node cluster, in the sense that it can only tolerate the failure of a single node. If you remove a single node from a fully-functional 4-node cluster, quorum will decrease to 2 you now have a 3-node cluster.
-
-### 5-node cluster
-Quorum of a 5-node cluster is 3.
-
-With a 5-node cluster, the cluster can tolerate the failure of 2 nodes. However if 3 nodes fail, at least one of those nodes must be restarted before you can make any change. If you remove a single node from a fully-functional 5-node cluster, quorum will be unchanged since you now have a 4-node cluster.
+### Example configuration
+Instruct rqlite to reap non-reachable voting nodes after 2 days, and non-reachable read-only nodes after 30 minutes:
+```bash
+rqlited -node-id 1 -raft-reap-node-timeout=48h -raft-reap-read-only-node-timeout=30m data
+```
+For reaping to work consistently you **must** set these flags on **every** voting node in the cluster -- in otherwords, every node that could potentially become the Leader. You can also set the flags on read-only nodes, but they will simply be silently ignored.
 
 # Dealing with failure
 It is the nature of clustered systems that nodes can fail at anytime. Depending on the size of your cluster, it will tolerate various amounts of failure. With a 3-node cluster, it can tolerate the failure of a single node, including the leader.
@@ -130,7 +116,9 @@ In the event that multiple rqlite nodes are lost, causing a loss of quorum and a
 
 To begin, stop all remaining nodes. You can attempt a graceful node-removal, but it will not work in most cases. Do not worry if the remove operation results in an error. The cluster is in an unhealthy state, so this is expected.
 
-The next step is to go to the _data_ directory of each rqlite node. Inside that directory, there will be a `raft/` sub-directory. You need to create a `peers.json` file within that directory, which will contain the desired configuration of your recovered rqlite cluster (which may be smaller than the original cluster, perhaps even just a single recovered node). This file should be formatted as a JSON array containing the node ID, `address:port`, and suffrage information of each rqlite node in the cluster. An example is shown below:
+The next step is to go to the _data_ directory of each rqlite node you wish to bring back up. Inside that directory, there will be a `raft/` sub-directory. You need to create a `peers.json` file within that directory, which will contain the desired configuration of your recovered rqlite cluster (which may be smaller than the original cluster, perhaps even just a single recovered node). This file should be formatted as a JSON array containing the node ID, `address:port`, and suffrage information of each rqlite node in the cluster.
+
+Below is an example, of bringing a 3-node cluster back online. 
 
 ```json
 [
@@ -154,6 +142,33 @@ The next step is to go to the _data_ directory of each rqlite node. Inside that 
 
 `id` specifies the node ID of the server, which must not be changed from its previous value. The ID for a given node can be found in the logs when the node starts up if it was auto-generated. `address` specifies the desired Raft IP and port for the node, which does not need to be the same as previously. You can use hostnames instead of IP addresses if you prefer. `non_voter` controls whether the server is a read-only node. If omitted, it will default to false, which is typical for most rqlite nodes.
 
-Next simply create entries for all nodes. You must confirm that nodes you do not include here have indeed failed and will not later rejoin the cluster. Ensure that this file is the same across all remaining rqlite nodes. At this point, you can restart your rqlite cluster.
+Next simply create entries for all the nodes you plan to bring up (in the example above that's 3 nodes). You must confirm that nodes you don't include here have indeed failed and will not later rejoin the cluster. Ensure that this file is the same across all remaining rqlite nodes. At this point, you can restart your rqlite cluster. In the example above, this means you'd start 3 nodes.
 
 Once recovery is completed, the `peers.json` file is renamed to `peers.info`. `peers.info` will not trigger further recoveries, and simply acts as a record for future reference. It may be deleted at anytime.
+
+# Example Cluster Sizes
+_Quorum is defined as (N/2)+1 where N is the size of the cluster._
+
+## 2-node cluster
+Quorum of a 2-node cluster is 2.
+
+If 1 node fails, quorum can no longer reached. The failing node must be recovered, as the failed node cannot be removed, and a new node cannot be added to the cluster to takes its place. This is why you shouldn't run 2-node clusters, except for testing purposes. In general it doesn't make much sense to run clusters with even-number of nodes at all.
+
+If you remove a single node from a fully-functional 2-node cluster, quorum will be reduced to 1 since you will be left with a 1-node cluster.
+
+## 3-node cluster
+Quorum of a 3-node cluster is 2.
+
+If 1 node fails, the cluster can still reach quorum. Remove the failing node, or restart it. If you remove the node, quorum remains at 2. You should add a new node to get the cluster back to 3 nodes in size. If 2 nodes fail, the cluster will not be able to reach quorum. You must instead restart at least one of the nodes.
+
+If you remove a single node from a fully-functional 3-node cluster, quorum will be unchanged since you now have a 2-node cluster.
+
+## 4-node cluster
+Quorum of a 4-node cluster is 3.
+
+The situation is similar for a 3-node cluster, in the sense that it can only tolerate the failure of a single node. If you remove a single node from a fully-functional 4-node cluster, quorum will decrease to 2 you now have a 3-node cluster.
+
+## 5-node cluster
+Quorum of a 5-node cluster is 3.
+
+With a 5-node cluster, the cluster can tolerate the failure of 2 nodes. However if 3 nodes fail, at least one of those nodes must be restarted before you can make any change. If you remove a single node from a fully-functional 5-node cluster, quorum will be unchanged since you now have a 4-node cluster.

@@ -20,6 +20,11 @@ const (
 	DiscoModeEtcdKV   = "etcd-kv"
 	DiscoModeDNS      = "dns"
 	DiscoModeDNSSRV   = "dns-srv"
+
+	HTTPAddrFlag    = "http-addr"
+	HTTPAdvAddrFlag = "http-adv-addr"
+	RaftAddrFlag    = "raft-addr"
+	RaftAdvAddrFlag = "raft-adv-addr"
 )
 
 // Config represents the configuration as set by command-line flags.
@@ -146,7 +151,7 @@ type Config struct {
 	// RaftLeaderLeaseTimeout sets the leader lease timeout.
 	RaftLeaderLeaseTimeout time.Duration
 
-	// RaftHeartbeatTimeout sets the heartbeast timeout.
+	// RaftHeartbeatTimeout sets the heartbeat timeout.
 	RaftHeartbeatTimeout time.Duration
 
 	// RaftElectionTimeout sets the election timeout.
@@ -158,10 +163,21 @@ type Config struct {
 	// RaftShutdownOnRemove sets whether Raft should be shutdown if the node is removed
 	RaftShutdownOnRemove bool
 
+	// RaftStepdownOnShutdown sets whether Leadership should be relinquished on shutdown
+	RaftStepdownOnShutdown bool
+
 	// RaftNoFreelistSync disables syncing Raft database freelist to disk. When true,
 	// it improves the database write performance under normal operation, but requires
 	// a full database re-sync during recovery.
 	RaftNoFreelistSync bool
+
+	// RaftReapNodeTimeout sets the duration after which a non-reachable voting node is
+	// reaped i.e. removed from the cluster.
+	RaftReapNodeTimeout time.Duration
+
+	// RaftReapReadOnlyNodeTimeout sets the duration after which a non-reachable non-voting node is
+	// reaped i.e. removed from the cluster.
+	RaftReapReadOnlyNodeTimeout time.Duration
 
 	// ClusterConnectTimeout sets the timeout when initially connecting to another node in
 	// the cluster, for non-Raft communications.
@@ -223,14 +239,27 @@ func (c *Config) Validate() error {
 	if _, _, err := net.SplitHostPort(c.HTTPAddr); err != nil {
 		return errors.New("HTTP bind address not valid")
 	}
-	if _, _, err := net.SplitHostPort(c.HTTPAdv); err != nil {
-		return errors.New("HTTP advertised address not valid")
+
+	hadv, _, err := net.SplitHostPort(c.HTTPAdv)
+	if err != nil {
+		return errors.New("HTTP advertised HTTP address not valid")
 	}
+	if addr := net.ParseIP(hadv); addr != nil && addr.IsUnspecified() {
+		return fmt.Errorf("advertised HTTP address is not routable (%s), specify it via -%s or -%s",
+			hadv, HTTPAddrFlag, HTTPAdvAddrFlag)
+	}
+
 	if _, _, err := net.SplitHostPort(c.RaftAddr); err != nil {
 		return errors.New("raft bind address not valid")
 	}
-	if _, _, err := net.SplitHostPort(c.RaftAdv); err != nil {
+
+	radv, _, err := net.SplitHostPort(c.RaftAdv)
+	if err != nil {
 		return errors.New("raft advertised address not valid")
+	}
+	if addr := net.ParseIP(radv); addr != nil && addr.IsUnspecified() {
+		return fmt.Errorf("advertised Raft address is not routable (%s), specify it via -%s or -%s",
+			radv, RaftAddrFlag, RaftAdvAddrFlag)
 	}
 
 	// Enforce bootstrapping policies
@@ -313,9 +342,10 @@ func (c *Config) DiscoConfigReader() io.ReadCloser {
 
 // BuildInfo is build information for display at command line.
 type BuildInfo struct {
-	Version string
-	Commit  string
-	Branch  string
+	Version       string
+	Commit        string
+	Branch        string
+	SQLiteVersion string
 }
 
 // ParseFlags parses the command line, and returns the configuration.
@@ -327,8 +357,8 @@ func ParseFlags(name, desc string, build *BuildInfo) (*Config, error) {
 	showVersion := false
 
 	flag.StringVar(&config.NodeID, "node-id", "", "Unique name for node. If not set, set to advertised Raft address")
-	flag.StringVar(&config.HTTPAddr, "http-addr", "localhost:4001", "HTTP server bind address. To enable HTTPS, set X.509 cert and key")
-	flag.StringVar(&config.HTTPAdv, "http-adv-addr", "", "Advertised HTTP address. If not set, same as HTTP server bind")
+	flag.StringVar(&config.HTTPAddr, HTTPAddrFlag, "localhost:4001", "HTTP server bind address. To enable HTTPS, set X.509 cert and key")
+	flag.StringVar(&config.HTTPAdv, HTTPAdvAddrFlag, "", "Advertised HTTP address. If not set, same as HTTP server bind")
 	flag.BoolVar(&config.TLS1011, "tls1011", false, "Support deprecated TLS versions 1.0 and 1.1")
 	flag.StringVar(&config.X509CACert, "http-ca-cert", "", "Path to root X.509 certificate for HTTP endpoint")
 	flag.StringVar(&config.X509Cert, "http-cert", "", "Path to X.509 certificate for HTTP endpoint")
@@ -340,8 +370,8 @@ func ParseFlags(name, desc string, build *BuildInfo) (*Config, error) {
 	flag.StringVar(&config.NodeX509Key, "node-key", "key.pem", "Path to X.509 private key for node-to-node encryption")
 	flag.BoolVar(&config.NoNodeVerify, "node-no-verify", false, "Skip verification of a remote node cert")
 	flag.StringVar(&config.AuthFile, "auth", "", "Path to authentication and authorization file. If not set, not enabled")
-	flag.StringVar(&config.RaftAddr, "raft-addr", "localhost:4002", "Raft communication bind address")
-	flag.StringVar(&config.RaftAdv, "raft-adv-addr", "", "Advertised Raft communication address. If not set, same as Raft bind")
+	flag.StringVar(&config.RaftAddr, RaftAddrFlag, "localhost:4002", "Raft communication bind address")
+	flag.StringVar(&config.RaftAdv, RaftAdvAddrFlag, "", "Advertised Raft communication address. If not set, same as Raft bind")
 	flag.StringVar(&config.JoinSrcIP, "join-source-ip", "", "Set source IP address during Join request")
 	flag.StringVar(&config.JoinAddr, "join", "", "Comma-delimited list of nodes, through which a cluster can be joined (proto://host:port)")
 	flag.StringVar(&config.JoinAs, "join-as", "", "Username in authentication file to join as. If not set, joins anonymously")
@@ -366,12 +396,15 @@ func ParseFlags(name, desc string, build *BuildInfo) (*Config, error) {
 	flag.Uint64Var(&config.RaftSnapThreshold, "raft-snap", 8192, "Number of outstanding log entries that trigger snapshot")
 	flag.DurationVar(&config.RaftSnapInterval, "raft-snap-int", 30*time.Second, "Snapshot threshold check interval")
 	flag.DurationVar(&config.RaftLeaderLeaseTimeout, "raft-leader-lease-timeout", 0, "Raft leader lease timeout. Use 0s for Raft default")
+	flag.BoolVar(&config.RaftStepdownOnShutdown, "raft-shutdown-stepdown", true, "Stepdown as leader before shutting down. Enabled by default")
 	flag.BoolVar(&config.RaftShutdownOnRemove, "raft-remove-shutdown", false, "Shutdown Raft if node removed")
 	flag.BoolVar(&config.RaftNoFreelistSync, "raft-no-freelist-sync", false, "Do not sync Raft log database freelist to disk")
 	flag.StringVar(&config.RaftLogLevel, "raft-log-level", "INFO", "Minimum log level for Raft module")
+	flag.DurationVar(&config.RaftReapNodeTimeout, "raft-reap-node-timeout", 0*time.Hour, "Time after which a non-reachable voting node will be reaped. If not set, no reaping takes place")
+	flag.DurationVar(&config.RaftReapReadOnlyNodeTimeout, "raft-reap-read-only-node-timeout", 0*time.Hour, "Time after which a non-reachable non-voting node will be reaped. If not set, no reaping takes place")
 	flag.DurationVar(&config.ClusterConnectTimeout, "cluster-connect-timeout", 30*time.Second, "Timeout for initial connection to other nodes")
-	flag.IntVar(&config.WriteQueueCap, "write-queue-capacity", 128, "Write queue capacity")
-	flag.IntVar(&config.WriteQueueBatchSz, "write-queue-batch-size", 16, "Write queue batch size")
+	flag.IntVar(&config.WriteQueueCap, "write-queue-capacity", 1024, "Write queue capacity")
+	flag.IntVar(&config.WriteQueueBatchSz, "write-queue-batch-size", 128, "Write queue batch size")
 	flag.DurationVar(&config.WriteQueueTimeout, "write-queue-timeout", 50*time.Millisecond, "Write queue timeout")
 	flag.BoolVar(&config.WriteQueueTx, "write-queue-tx", false, "Use a transaction when writing from queue")
 	flag.IntVar(&config.CompressionSize, "compression-size", 150, "Request query size for compression attempt")
@@ -386,10 +419,24 @@ func ParseFlags(name, desc string, build *BuildInfo) (*Config, error) {
 	flag.Parse()
 
 	if showVersion {
-		msg := fmt.Sprintf("%s %s %s %s %s (commit %s, branch %s, compiler %s)",
-			name, build.Version, runtime.GOOS, runtime.GOARCH, runtime.Version(), build.Commit, build.Branch, runtime.Compiler)
+		msg := fmt.Sprintf("%s %s %s %s %s sqlite%s (commit %s, branch %s, compiler %s)",
+			name, build.Version, runtime.GOOS, runtime.GOARCH, runtime.Version(), build.SQLiteVersion,
+			build.Commit, build.Branch, runtime.Compiler)
 		errorExit(0, msg)
 	}
+
+	// Ensure, if set explicitly, that reap times are not too low.
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "raft-reap-node-timeout" || f.Name == "raft-reap-read-only-node-timeout" {
+			d, err := time.ParseDuration(f.Value.String())
+			if err != nil {
+				errorExit(1, fmt.Sprintf("failed to parse duration: %s", err.Error()))
+			}
+			if d <= 0 {
+				errorExit(1, fmt.Sprintf("-%s must be greater than 0", f.Name))
+			}
+		}
+	})
 
 	// Ensure the data path is set.
 	if flag.NArg() < 1 {

@@ -1,6 +1,7 @@
 package http
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -8,10 +9,12 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/rqlite/rqlite/v7/cluster"
 	"github.com/rqlite/rqlite/v7/command"
 	"github.com/rqlite/rqlite/v7/store"
 	"github.com/rqlite/rqlite/v7/testdata/x509"
@@ -86,146 +89,11 @@ func Test_ResponseJSONMarshal(t *testing.T) {
 	}
 }
 
-func Test_NormalizeAddr(t *testing.T) {
-	tests := []struct {
-		orig string
-		norm string
-	}{
-		{
-			orig: "http://localhost:4001",
-			norm: "http://localhost:4001",
-		},
-		{
-			orig: "https://localhost:4001",
-			norm: "https://localhost:4001",
-		},
-		{
-			orig: "https://localhost:4001/foo",
-			norm: "https://localhost:4001/foo",
-		},
-		{
-			orig: "localhost:4001",
-			norm: "http://localhost:4001",
-		},
-		{
-			orig: "localhost",
-			norm: "http://localhost",
-		},
-		{
-			orig: ":4001",
-			norm: "http://:4001",
-		},
-	}
-
-	for _, tt := range tests {
-		if NormalizeAddr(tt.orig) != tt.norm {
-			t.Fatalf("%s not normalized correctly, got: %s", tt.orig, tt.norm)
-		}
-	}
-}
-
-func Test_EnsureHTTPS(t *testing.T) {
-	tests := []struct {
-		orig    string
-		ensured string
-	}{
-		{
-			orig:    "http://localhost:4001",
-			ensured: "https://localhost:4001",
-		},
-		{
-			orig:    "https://localhost:4001",
-			ensured: "https://localhost:4001",
-		},
-		{
-			orig:    "https://localhost:4001/foo",
-			ensured: "https://localhost:4001/foo",
-		},
-		{
-			orig:    "localhost:4001",
-			ensured: "https://localhost:4001",
-		},
-	}
-
-	for _, tt := range tests {
-		if e := EnsureHTTPS(tt.orig); e != tt.ensured {
-			t.Fatalf("%s not HTTPS ensured correctly, exp %s, got %s", tt.orig, tt.ensured, e)
-		}
-	}
-}
-
-func Test_AddBasicAuth(t *testing.T) {
-	var u string
-	var err error
-
-	u, err = AddBasicAuth("http://example.com", "user1", "pass1")
-	if err != nil {
-		t.Fatalf("failed to add user info: %s", err.Error())
-	}
-	if exp, got := "http://user1:pass1@example.com", u; exp != got {
-		t.Fatalf("wrong URL created, exp %s, got %s", exp, got)
-	}
-
-	u, err = AddBasicAuth("http://example.com", "user1", "")
-	if err != nil {
-		t.Fatalf("failed to add user info: %s", err.Error())
-	}
-	if exp, got := "http://user1:@example.com", u; exp != got {
-		t.Fatalf("wrong URL created, exp %s, got %s", exp, got)
-	}
-
-	u, err = AddBasicAuth("http://example.com", "", "pass1")
-	if err != nil {
-		t.Fatalf("failed to add user info: %s", err.Error())
-	}
-	if exp, got := "http://example.com", u; exp != got {
-		t.Fatalf("wrong URL created, exp %s, got %s", exp, got)
-	}
-
-	u, err = AddBasicAuth("http://user1:pass1@example.com", "user2", "pass2")
-	if err == nil {
-		t.Fatalf("failed to get expected error when UserInfo exists")
-	}
-}
-
-func Test_RemoveBasicAuth(t *testing.T) {
-	tests := []struct {
-		orig    string
-		removed string
-	}{
-		{
-			orig:    "localhost",
-			removed: "localhost",
-		},
-		{
-			orig:    "http://localhost:4001",
-			removed: "http://localhost:4001",
-		},
-		{
-			orig:    "https://foo:bar@localhost",
-			removed: "https://localhost",
-		},
-		{
-			orig:    "https://foo:bar@localhost:4001",
-			removed: "https://localhost:4001",
-		},
-		{
-			orig:    "http://foo:bar@localhost:4001/path",
-			removed: "http://localhost:4001/path",
-		},
-	}
-
-	for _, tt := range tests {
-		if e := RemoveBasicAuth(tt.orig); e != tt.removed {
-			t.Fatalf("%s BasicAuth not removed correctly, exp %s, got %s", tt.orig, tt.removed, e)
-		}
-	}
-}
-
 func Test_NewService(t *testing.T) {
-	m := &MockStore{}
-	c := &mockClusterService{}
-	s := New("127.0.0.1:0", m, c, nil)
+	store := &MockStore{}
+	cluster := &mockClusterService{}
+	cred := &mockCredentialStore{HasPermOK: true}
+	s := New("127.0.0.1:0", store, cluster, cred)
 	if s == nil {
 		t.Fatalf("failed to create new service")
 	}
@@ -470,7 +338,7 @@ func Test_400Routes(t *testing.T) {
 }
 
 func Test_401Routes_NoBasicAuth(t *testing.T) {
-	c := &mockCredentialStore{CheckOK: false, HasPermOK: false}
+	c := &mockCredentialStore{HasPermOK: false}
 
 	m := &MockStore{}
 	n := &mockClusterService{}
@@ -512,7 +380,7 @@ func Test_401Routes_NoBasicAuth(t *testing.T) {
 }
 
 func Test_401Routes_BasicAuthBadPassword(t *testing.T) {
-	c := &mockCredentialStore{CheckOK: false, HasPermOK: false}
+	c := &mockCredentialStore{HasPermOK: false}
 
 	m := &MockStore{}
 	n := &mockClusterService{}
@@ -559,7 +427,7 @@ func Test_401Routes_BasicAuthBadPassword(t *testing.T) {
 }
 
 func Test_401Routes_BasicAuthBadPerm(t *testing.T) {
-	c := &mockCredentialStore{CheckOK: true, HasPermOK: false}
+	c := &mockCredentialStore{HasPermOK: false}
 
 	m := &MockStore{}
 	n := &mockClusterService{}
@@ -605,6 +473,90 @@ func Test_401Routes_BasicAuthBadPerm(t *testing.T) {
 	}
 }
 
+func Test_401Join(t *testing.T) {
+	jf := func(_, _, perm string) bool {
+		return perm == "join" || perm == "join-read-only"
+	}
+	c := &mockCredentialStore{aaFunc: jf}
+
+	m := &MockStore{}
+	n := &mockClusterService{}
+	s := New("127.0.0.1:0", m, n, c)
+	if err := s.Start(); err != nil {
+		t.Fatalf("failed to start service")
+	}
+	defer s.Close()
+
+	client := &http.Client{}
+	host := fmt.Sprintf("http://%s", s.Addr().String())
+
+	resp, err := client.Post(host+"/join", "application/json", strings.NewReader(`{"id": "1", "addr":"localhost:4001", "voter": true}`))
+	if err != nil {
+		t.Fatalf("failed to make join request")
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("failed to get expected StatusOK for join, got %d", resp.StatusCode)
+	}
+
+	resp, err = client.Post(host+"/join", "application/json", strings.NewReader(`{"id": "1", "addr":"localhost:4001"}`))
+	if err != nil {
+		t.Fatalf("failed to make join request")
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("failed to get expected StatusOK for join, got %d", resp.StatusCode)
+	}
+
+	resp, err = client.Post(host+"/join", "application/json", strings.NewReader(`{"id": "1", "addr":"localhost:4001", "voter": false}`))
+	if err != nil {
+		t.Fatalf("failed to make join request")
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("failed to get expected StatusOK for non-voter join, got %d", resp.StatusCode)
+	}
+}
+
+func Test_401JoinReadOnly(t *testing.T) {
+	jf := func(_, _, perm string) bool {
+		return perm == "join-read-only"
+	}
+	c := &mockCredentialStore{aaFunc: jf}
+
+	m := &MockStore{}
+	n := &mockClusterService{}
+	s := New("127.0.0.1:0", m, n, c)
+	if err := s.Start(); err != nil {
+		t.Fatalf("failed to start service")
+	}
+	defer s.Close()
+
+	client := &http.Client{}
+	host := fmt.Sprintf("http://%s", s.Addr().String())
+
+	resp, err := client.Post(host+"/join", "application/json", strings.NewReader(`{"id": "1", "addr":"localhost:4001", "voter": true}`))
+	if err != nil {
+		t.Fatalf("failed to make join request")
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("failed to get expected StatusUnauthorized for join, got %d", resp.StatusCode)
+	}
+
+	resp, err = client.Post(host+"/join", "application/json", strings.NewReader(`{"id": "1", "addr":"localhost:4001"}`))
+	if err != nil {
+		t.Fatalf("failed to make join request")
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("failed to get expected StatusUnauthorized for join, got %d", resp.StatusCode)
+	}
+
+	resp, err = client.Post(host+"/join", "application/json", strings.NewReader(`{"id": "1", "addr":"localhost:4001", "voter": false}`))
+	if err != nil {
+		t.Fatalf("failed to make join request")
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("failed to get expected StatusOK for non-voter join, got %d", resp.StatusCode)
+	}
+}
+
 func Test_BackupOK(t *testing.T) {
 	m := &MockStore{}
 	c := &mockClusterService{}
@@ -614,7 +566,7 @@ func Test_BackupOK(t *testing.T) {
 	}
 	defer s.Close()
 
-	m.backupFn = func(leader bool, f store.BackupFormat, dst io.Writer) error {
+	m.backupFn = func(br *command.BackupRequest, dst io.Writer) error {
 		return nil
 	}
 
@@ -629,7 +581,7 @@ func Test_BackupOK(t *testing.T) {
 	}
 }
 
-func Test_BackupFlagsNoLeader(t *testing.T) {
+func Test_BackupFlagsNoLeaderRedirect(t *testing.T) {
 	m := &MockStore{}
 	c := &mockClusterService{
 		apiAddr: "http://1.2.3.4:999",
@@ -642,8 +594,48 @@ func Test_BackupFlagsNoLeader(t *testing.T) {
 	}
 	defer s.Close()
 
-	m.backupFn = func(leader bool, f store.BackupFormat, dst io.Writer) error {
+	m.backupFn = func(br *command.BackupRequest, dst io.Writer) error {
 		return store.ErrNotLeader
+	}
+
+	client := &http.Client{}
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	host := fmt.Sprintf("http://%s", s.Addr().String())
+	resp, err := client.Get(host + "/db/backup?redirect")
+	if err != nil {
+		t.Fatalf("failed to make backup request: %s", err.Error())
+	}
+	if resp.StatusCode != http.StatusMovedPermanently {
+		t.Fatalf("failed to get expected StatusServiceUnavailable for backup, got %d", resp.StatusCode)
+	}
+}
+
+func Test_BackupFlagsNoLeaderRemoteFetch(t *testing.T) {
+	m := &MockStore{
+		leaderAddr: "foo:1234",
+	}
+	c := &mockClusterService{
+		apiAddr: "http://1.2.3.4:999",
+	}
+
+	s := New("127.0.0.1:0", m, c, nil)
+
+	if err := s.Start(); err != nil {
+		t.Fatalf("failed to start service")
+	}
+	defer s.Close()
+
+	m.backupFn = func(br *command.BackupRequest, dst io.Writer) error {
+		return store.ErrNotLeader
+	}
+
+	backupData := "this is SQLite data"
+	c.backupFn = func(br *command.BackupRequest, addr string, t time.Duration, w io.Writer) error {
+		w.Write([]byte(backupData))
+		return nil
 	}
 
 	client := &http.Client{}
@@ -656,8 +648,13 @@ func Test_BackupFlagsNoLeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to make backup request: %s", err.Error())
 	}
-	if resp.StatusCode != http.StatusMovedPermanently {
-		t.Fatalf("failed to get expected StatusServiceUnavailable for backup, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("failed to get expected StatusOK for remote backup fetch, got %d", resp.StatusCode)
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if exp, got := backupData, string(body); exp != got {
+		t.Fatalf("received incorrect backup data, exp: %s, got: %s", exp, got)
 	}
 }
 
@@ -674,8 +671,8 @@ func Test_BackupFlagsNoLeaderOK(t *testing.T) {
 	}
 	defer s.Close()
 
-	m.backupFn = func(leader bool, f store.BackupFormat, dst io.Writer) error {
-		if !leader {
+	m.backupFn = func(br *command.BackupRequest, dst io.Writer) error {
+		if !br.Leader {
 			return nil
 		}
 		return store.ErrNotLeader
@@ -690,6 +687,197 @@ func Test_BackupFlagsNoLeaderOK(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("failed to get expected StatusOK for backup, got %d", resp.StatusCode)
 	}
+}
+
+func Test_LoadOK(t *testing.T) {
+	m := &MockStore{}
+	c := &mockClusterService{}
+	s := New("127.0.0.1:0", m, c, nil)
+	if err := s.Start(); err != nil {
+		t.Fatalf("failed to start service")
+	}
+	defer s.Close()
+
+	client := &http.Client{}
+	host := fmt.Sprintf("http://%s", s.Addr().String())
+	resp, err := client.Post(host+"/db/load", "application/octet-stream", strings.NewReader("SELECT"))
+	if err != nil {
+		t.Fatalf("failed to make load request")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("failed to get expected StatusOK for load, got %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read response body: %s", err.Error())
+	}
+	if exp, got := `{"results":[]}`, string(body); exp != got {
+		t.Fatalf("incorrect response body, exp: %s, got %s", exp, got)
+	}
+}
+
+func Test_LoadFlagsNoLeader(t *testing.T) {
+	m := &MockStore{
+		leaderAddr: "foo:1234",
+	}
+	c := &mockClusterService{
+		apiAddr: "http://1.2.3.4:999",
+	}
+
+	s := New("127.0.0.1:0", m, c, nil)
+
+	if err := s.Start(); err != nil {
+		t.Fatalf("failed to start service")
+	}
+	defer s.Close()
+
+	testData, err := os.ReadFile("testdata/load.db")
+	if err != nil {
+		t.Fatalf("failed to load test SQLite data")
+	}
+
+	m.loadFn = func(br *command.LoadRequest) error {
+		return store.ErrNotLeader
+	}
+
+	clusterLoadCalled := false
+	c.loadFn = func(lr *command.LoadRequest, nodeAddr string, timeout time.Duration) error {
+		clusterLoadCalled = true
+		if bytes.Compare(lr.Data, testData) != 0 {
+			t.Fatalf("wrong data passed to cluster load")
+		}
+		return nil
+	}
+
+	client := &http.Client{}
+	host := fmt.Sprintf("http://%s", s.Addr().String())
+	resp, err := client.Post(host+"/db/load", "application/octet-stream", bytes.NewReader(testData))
+	if err != nil {
+		t.Fatalf("failed to make load request")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("failed to get expected StatusOK for load, got %d", resp.StatusCode)
+	}
+
+	if !clusterLoadCalled {
+		t.Fatalf("cluster load was not called")
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read response body: %s", err.Error())
+	}
+	if exp, got := `{"results":[]}`, string(body); exp != got {
+		t.Fatalf("incorrect response body, exp: %s, got %s", exp, got)
+	}
+}
+
+func Test_LoadRemoteError(t *testing.T) {
+	m := &MockStore{
+		leaderAddr: "foo:1234",
+	}
+	c := &mockClusterService{
+		apiAddr: "http://1.2.3.4:999",
+	}
+
+	s := New("127.0.0.1:0", m, c, nil)
+
+	if err := s.Start(); err != nil {
+		t.Fatalf("failed to start service")
+	}
+	defer s.Close()
+
+	testData, err := os.ReadFile("testdata/load.db")
+	if err != nil {
+		t.Fatalf("failed to load test SQLite data")
+	}
+
+	m.loadFn = func(br *command.LoadRequest) error {
+		return store.ErrNotLeader
+	}
+	clusterLoadCalled := false
+	c.loadFn = func(lr *command.LoadRequest, addr string, t time.Duration) error {
+		clusterLoadCalled = true
+		return fmt.Errorf("the load failed")
+	}
+
+	client := &http.Client{}
+	host := fmt.Sprintf("http://%s", s.Addr().String())
+	resp, err := client.Post(host+"/db/load", "application/octet-stream", bytes.NewReader(testData))
+	if err != nil {
+		t.Fatalf("failed to make load request")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("failed to get expected StatusInternalServerError for load, got %d", resp.StatusCode)
+	}
+
+	if !clusterLoadCalled {
+		t.Fatalf("cluster load was not called")
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read response body: %s", err.Error())
+	}
+	if exp, got := "the load failed\n", string(body); exp != got {
+		t.Fatalf(`incorrect response body, exp: "%s", got: "%s"`, exp, got)
+	}
+}
+
+func Test_NotifyLocalhost(t *testing.T) {
+	m := &MockStore{}
+	c := &mockClusterService{}
+	s := New("127.0.0.1:0", m, c, nil)
+	if err := s.Start(); err != nil {
+		t.Fatalf("failed to start service")
+	}
+	defer s.Close()
+
+	client := &http.Client{}
+	host := fmt.Sprintf("http://%s", s.Addr().String())
+	resp, err := client.Post(host+"/notify", "application/json", mustMarshalNotifyMap("id1", "localhost"))
+	if err != nil {
+		t.Fatalf("failed to make load request")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("failed to get expected StatusOK for notify, got %d", resp.StatusCode)
+	}
+}
+
+func Test_NotifyNoResolve(t *testing.T) {
+	m := &MockStore{}
+	c := &mockClusterService{}
+	s := New("127.0.0.1:0", m, c, nil)
+	if err := s.Start(); err != nil {
+		t.Fatalf("failed to start service")
+	}
+	defer s.Close()
+
+	client := &http.Client{}
+	host := fmt.Sprintf("http://%s", s.Addr().String())
+	resp, err := client.Post(host+"/notify", "application/json", mustMarshalNotifyMap("id1", "nonsense-domain:4444"))
+	if err != nil {
+		t.Fatalf("failed to make load request")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("failed to get expected StatusOK for load, got %d", resp.StatusCode)
+	}
+}
+
+func mustMarshalNotifyMap(id, addr string) io.Reader {
+	buf, err := json.Marshal(map[string]interface{}{
+		"id":   id,
+		"addr": addr,
+	})
+	if err != nil {
+		panic("failed to marshal notify map")
+	}
+	return bytes.NewReader(buf)
 }
 
 func Test_RegisterStatus(t *testing.T) {
@@ -951,7 +1139,7 @@ func Test_TLSServce(t *testing.T) {
 	m := &MockStore{}
 	c := &mockClusterService{}
 	var s *Service
-	tempDir := mustTempDir()
+	tempDir := t.TempDir()
 
 	s = New("127.0.0.1:0", m, c, nil)
 	s.CertFile = x509.CertFile(tempDir)
@@ -1050,7 +1238,8 @@ func Test_timeoutQueryParam(t *testing.T) {
 type MockStore struct {
 	executeFn  func(er *command.ExecuteRequest) ([]*command.ExecuteResult, error)
 	queryFn    func(qr *command.QueryRequest) ([]*command.QueryRows, error)
-	backupFn   func(leader bool, f store.BackupFormat, dst io.Writer) error
+	backupFn   func(br *command.BackupRequest, dst io.Writer) error
+	loadFn     func(lr *command.LoadRequest) error
 	leaderAddr string
 }
 
@@ -1068,10 +1257,6 @@ func (m *MockStore) Query(qr *command.QueryRequest) ([]*command.QueryRows, error
 	return nil, nil
 }
 
-func (m *MockStore) Load(lr *command.LoadRequest) error {
-	return nil
-}
-
 func (m *MockStore) Join(id, addr string, voter bool) error {
 	return nil
 }
@@ -1080,7 +1265,7 @@ func (m *MockStore) Notify(id, addr string) error {
 	return nil
 }
 
-func (m *MockStore) Remove(id string) error {
+func (m *MockStore) Remove(rn *command.RemoveNodeRequest) error {
 	return nil
 }
 
@@ -1096,56 +1281,86 @@ func (m *MockStore) Nodes() ([]*store.Server, error) {
 	return nil, nil
 }
 
-func (m *MockStore) Backup(leader bool, f store.BackupFormat, w io.Writer) error {
+func (m *MockStore) Backup(br *command.BackupRequest, w io.Writer) error {
 	if m.backupFn == nil {
 		return nil
 	}
-	return m.backupFn(leader, f, w)
+	return m.backupFn(br, w)
+}
+
+func (m *MockStore) Load(lr *command.LoadRequest) error {
+	if m.loadFn != nil {
+		return m.loadFn(lr)
+	}
+	return nil
 }
 
 type mockClusterService struct {
-	apiAddr   string
-	executeFn func(er *command.ExecuteRequest, addr string, t time.Duration) ([]*command.ExecuteResult, error)
-	queryFn   func(qr *command.QueryRequest, addr string, t time.Duration) ([]*command.QueryRows, error)
+	apiAddr      string
+	executeFn    func(er *command.ExecuteRequest, addr string, t time.Duration) ([]*command.ExecuteResult, error)
+	queryFn      func(qr *command.QueryRequest, addr string, t time.Duration) ([]*command.QueryRows, error)
+	backupFn     func(br *command.BackupRequest, addr string, t time.Duration, w io.Writer) error
+	loadFn       func(lr *command.LoadRequest, addr string, t time.Duration) error
+	removeNodeFn func(rn *command.RemoveNodeRequest, nodeAddr string, t time.Duration) error
 }
 
 func (m *mockClusterService) GetNodeAPIAddr(a string, t time.Duration) (string, error) {
 	return m.apiAddr, nil
 }
 
-func (m *mockClusterService) Execute(er *command.ExecuteRequest, addr string, t time.Duration) ([]*command.ExecuteResult, error) {
+func (m *mockClusterService) Execute(er *command.ExecuteRequest, addr string, creds *cluster.Credentials, t time.Duration) ([]*command.ExecuteResult, error) {
 	if m.executeFn != nil {
 		return m.executeFn(er, addr, t)
 	}
 	return nil, nil
 }
 
-func (m *mockClusterService) Query(qr *command.QueryRequest, addr string, t time.Duration) ([]*command.QueryRows, error) {
+func (m *mockClusterService) Query(qr *command.QueryRequest, addr string, creds *cluster.Credentials, t time.Duration) ([]*command.QueryRows, error) {
 	if m.queryFn != nil {
 		return m.queryFn(qr, addr, t)
 	}
 	return nil, nil
 }
 
+func (m *mockClusterService) Backup(br *command.BackupRequest, addr string, creds *cluster.Credentials, t time.Duration, w io.Writer) error {
+	if m.backupFn != nil {
+		return m.backupFn(br, addr, t, w)
+	}
+	return nil
+}
+
+func (m *mockClusterService) Load(lr *command.LoadRequest, addr string, creds *cluster.Credentials, t time.Duration) error {
+	if m.loadFn != nil {
+		return m.loadFn(lr, addr, t)
+	}
+	return nil
+}
+
+func (m *mockClusterService) RemoveNode(rn *command.RemoveNodeRequest, addr string, creds *cluster.Credentials, t time.Duration) error {
+	if m.removeNodeFn != nil {
+		return m.removeNodeFn(rn, addr, t)
+	}
+	return nil
+}
+
 type mockCredentialStore struct {
-	CheckOK   bool
 	HasPermOK bool
+	aaFunc    func(username, password, perm string) bool
 }
 
-func (m *mockCredentialStore) Check(username, password string) bool {
-	return m.CheckOK
-}
+func (m *mockCredentialStore) AA(username, password, perm string) bool {
+	if m == nil {
+		return true
+	}
 
-func (m *mockCredentialStore) HasPerm(username, perm string) bool {
+	if m.aaFunc != nil {
+		return m.aaFunc(username, password, perm)
+	}
 	return m.HasPermOK
 }
 
 func (m *mockClusterService) Stats() (map[string]interface{}, error) {
 	return nil, nil
-}
-
-func (m *mockCredentialStore) HasAnyPerm(username string, perm ...string) bool {
-	return m.HasPermOK
 }
 
 type mockStatusReporter struct {
@@ -1161,15 +1376,6 @@ func mustNewHTTPRequest(url string) *http.Request {
 		panic("failed to create HTTP request for testing")
 	}
 	return req
-}
-
-func mustTempDir() string {
-	var err error
-	path, err := ioutil.TempDir("", "rqlilte-system-test-")
-	if err != nil {
-		panic("failed to create temp dir")
-	}
-	return path
 }
 
 func mustURLParse(s string) *url.URL {

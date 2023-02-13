@@ -1,4 +1,125 @@
+## 7.13.2 (unreleased)
+### Implementation changes and bug fixes
+- [PR #1156](https://github.com/rqlite/rqlite/pull/1156): Better error message when rqlite shell can't connect to a node.
+
+## 7.13.1 (January 6th 2023)
+### Implementation changes and bug fixes
+- [PR #1146](https://github.com/rqlite/rqlite/pull/1146): Delete history file if `RQLITE_HISTFILESIZE` environment variable is zero. Fixes [issue #1145](https://github.com/rqlite/rqlite/issues/1145). Thanks @jamielinux
+- [PR #1148](https://github.com/rqlite/rqlite/pull/1148): go mod updates.
+
+## 7.13.0 (December 15th 2022)
+### New features
+- [PR #1141](https://github.com/rqlite/rqlite/pull/1141): Store and load CLI history across sessions.
+
+## 7.12.1 (December 7th 2022)
+### Implementation changes and bug fixes
+- [PR #1135](https://github.com/rqlite/rqlite/pull/1135): Silently ignore self-joins if nothing has changed on the joining node.
+- [PR #1136](https://github.com/rqlite/rqlite/pull/1136): Stop HTTP server gracefully on node shutdown.
+- [f6c4b17](https://github.com/rqlite/rqlite/commit/f6c4b17a727809696f952a018b2262681932f521): By default, Leader node will stepdown if that node is shutting down.
+- [PR #1139](https://github.com/rqlite/rqlite/pull/1139): Cache hashed passwords. Fixes [issue #1138](https://github.com/rqlite/rqlite/issues/1138).
+- [PR #1140](https://github.com/rqlite/rqlite/pull/1140): Use SQLite with corrected in-memory database locking ([SQLite forum post](https://sqlite.org/forum/forumpost/d443fb0730)). Fixes [issue #1103](https://github.com/rqlite/rqlite/issues/1103).
+
+## 7.12.0 (December 1st 2022)
+### New features
+- [PR #1121](https://github.com/rqlite/rqlite/pull/1121): Transparently forward node-removal requests to Leader.
+- [PR #1125](https://github.com/rqlite/rqlite/pull/1125): Support fetching a subset of expvar information.
+- [PR #1134](https://github.com/rqlite/rqlite/pull/1134): Support stepping down as Leader before shutting down.
+
+### Implementation changes and bug fixes
+- [PR #1120](https://github.com/rqlite/rqlite/pull/1120): go mod updates.
+- [PR #1126](https://github.com/rqlite/rqlite/pull/1126): Add Queue instrumentation.
+- [PR #1127](https://github.com/rqlite/rqlite/pull/1127): Clearer Queued Writes loop logic.
+- [PR #1128](https://github.com/rqlite/rqlite/pull/1128): Add ResetStats to some modules.
+
+## 7.11.0 (November 15th 2022)
+### New features
+- [PR #1114](https://github.com/rqlite/rqlite/pull/1114), [PR #1118](https://github.com/rqlite/rqlite/pull/1118): Support automatically removing non-reachable nodes after a configurable period. Fixes [issue #728](https://github.com/rqlite/rqlite/issues/728).
+- [PR #1116](https://github.com/rqlite/rqlite/pull/1116), [PR #1117](https://github.com/rqlite/rqlite/pull/1117): Support associative form for query responses. Fixes [issue #1115](https://github.com/rqlite/rqlite/issues/1115).
+
+## 7.10.1 (November 11th 2022)
+
+### Implementation changes and bug fixes
+- [PR #1097](https://github.com/rqlite/rqlite/pull/1097), [PR #1110](https://github.com/rqlite/rqlite/pull/1100): Start HTTP server as soon as possible after launch.
+- [PR #1098](https://github.com/rqlite/rqlite/pull/1098): Bootstrapper doesn't need to know the bootstrap-expect value.
+- [PR #1099](https://github.com/rqlite/rqlite/pull/1099): Add explicit `.exit` option to CLI.
+- [PR #1102](https://github.com/rqlite/rqlite/pull/1102): Use BasicAuth redaction functionality from the standard library.
+- [PR #1108](https://github.com/rqlite/rqlite/pull/1108): Add more upgrade testing.
+- [PR #1109](https://github.com/rqlite/rqlite/pull/1109): Higher Queued Writes defaults
+- [PR #1113](https://github.com/rqlite/rqlite/pull/1113): go mod updates
+
+## 7.10.0 (October 26th 2022)
+### New features
+- [PR #1096](https://github.com/rqlite/rqlite/pull/1096): Upgrade to SQLite 3.39.4.
+
+### Implementation changes and bug fixes
+- [PR #1094](https://github.com/rqlite/rqlite/pull/1094): Update packages to resolve CVE-2022-32149 and CVE-2022-27664. Thanks @sgalsaleh
+- [PR #1095](https://github.com/rqlite/rqlite/pull/1095): Log, and add to version output, the SQLite release.
+- [PR #1096](https://github.com/rqlite/rqlite/pull/1096): go mod updates.
+
+## 7.9.2 (October 24th 2022)
+This release addresses a shortcoming in inter-node communications. Nodes now consistently encode the length of those communications using 8-byte values. **If any node in a cluster is upgraded to this release, then all nodes in that cluster should be**. 
+
+### Implementation changes and bug fixes
+- [PR #1089](https://github.com/rqlite/rqlite/pull/1089): Move to 8-byte Protobuf lengths for cluster communications. Fixes [issue #1088](https://github.com/rqlite/rqlite/issues/1088).
+- [PR #1090](https://github.com/rqlite/rqlite/pull/1090): Correct error handling for remote load and backup failures.
+
+## 7.9.1 (October 23rd 2022)
+### Implementation changes and bug fixes
+- [PR #1086](https://github.com/rqlite/rqlite/pull/1086): Restoring via follower should have same HTTP response body.
+- [PR #1087](https://github.com/rqlite/rqlite/pull/1087): Notified and joined node checks address resolution.
+
+## 7.9.0 (October 22nd 2022)
+This release makes it more convenient to load SQLite files directly into rqlite, as any node can now process the request. For this to work however, all nodes in your cluster must be running 7.9.0 (or later). Otherwse 7.9.0 is fully compatible with earlier release, so a rolling upgrade process is an option.
+
+### New features
+- [PR #1084](https://github.com/rqlite/rqlite/pull/1084): Transparently forward SQLite data Restore requests to Leaders.
+
+### Implementation changes and bug fixes
+- [PR #1085](https://github.com/rqlite/rqlite/pull/1085): Improved logs during joining.
+
+## 7.8.0 (October 20th 2022)
+This release makes it more convenient to retrieve a backup. Now any node can provide a backup of the underlying SQLite database. For this to work however, all nodes in your cluster must be running 7.8.0 (or later). Otherwse 7.8.0 is fully compatible with earlier release, so a rolling upgrade process is an option.
+
+### New features
+- [PR #1081](https://github.com/rqlite/rqlite/pull/1081): Transparently forward Backup requests to Leaders.
+
+### Implementation changes and bug fixes
+- [PR #1079](https://github.com/rqlite/rqlite/pull/1079): Use a Protobuf model for Backup requests.
+- [PR #1078](https://github.com/rqlite/rqlite/pull/1078): Decrease bootstrap polling interval from 5 seconds to 2 seconds.
+- [PR #1082](https://github.com/rqlite/rqlite/pull/1082): Small refactor of backup code.
+
+## 7.7.2 (October 14th 2022)
+### Implementation changes and bug fixes
+- [PR #1075](https://github.com/rqlite/rqlite/pull/1075): Upgrade to latest SQL parser. Fixes [issue #1072](https://github.com/rqlite/rqlite/issues/1072)
+
+## 7.7.1 (October 13th 2022)
+### Implementation changes and bug fixes
+- [PR #1074](https://github.com/rqlite/rqlite/pull/1074): Support `NULL` as a paramterized value. Fixes [issue #1073](https://github.com/rqlite/rqlite/issues/1073)
+
+## 7.7.0 (September 28th 2022)
+This release adds support for SQLite [`RANDOM()`](https://www.sqlite.org/deterministic.html), the first such [support for non-deterministic functions](https://github.com/rqlite/rqlite/blob/master/DOC/NON_DETERMINISTIC_FUNCTIONS.md). It does this via statement-rewriting.
+
+### New features
+- [PR #1046](https://github.com/rqlite/rqlite/pull/1046): Add rewriting of SQLite `RANDOM()` so statements with this function are safe to use.
+
+### Implementation changes and bug fixes
+- [PR #1064](https://github.com/rqlite/rqlite/pull/1064): Upgrade dependencies, and move to requiring Go 1.18 (or later) for building.
+
+## 7.6.1 (August 7th 2022)
+
+### Implementation changes and bug fixes
+- [PR #1058](https://github.com/rqlite/rqlite/pull/1058): `rqlited` terminates if passed unroutable advertised Raft or HTTP addresses.
+- [PR #1057](https://github.com/rqlite/rqlite/pull/1057), [PR #1059](https://github.com/rqlite/rqlite/pull/1059): Perform credential checking with intra-cluster communications. Fixes [issue #1051](https://github.com/rqlite/rqlite/issues/1051). Thanks @ngharrington
+
+## 7.6.0 (July 19th 2022)
+### New features
+- [PR #1055](https://github.com/rqlite/rqlite/pull/1055): Add new `join-read-only` permission.
+
+### Implementation changes and bug fixes
+- [PR #1049](https://github.com/rqlite/rqlite/pull/1049): Ignore freshness when serving queries on Leader. Fixes [issue #1048](https://github.com/rqlite/rqlite/issues/1048). Thanks to @Tjstretchalot for the bug report.
+
 ## 7.5.1 (June 13th 2022)
+### Implementation changes and bug fixes
 - [PR #1043](https://github.com/rqlite/rqlite/pull/1043): Allow cluster-connect timeout to be configurable. Fixes [issue #1042](https://github.com/rqlite/rqlite/issues/1042).
 
 ## 7.5.0 (May 26th 2022)

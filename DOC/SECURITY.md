@@ -1,4 +1,6 @@
 # Securing rqlite
+> :warning: **This page is no longer maintained. Visit [rqlite.io](https://www.rqlite.io) for the latest docs.**
+
 rqlite can be secured in various way, and with different levels of control.
 
 ## File system security
@@ -45,6 +47,7 @@ rqlite, via the configuration file, also supports user-level permissions. Each u
 - _status_: user can retrieve node status and Go runtime information.
 - _ready_: user can retrieve node readiness.
 - _join_: user can join a cluster. In practice only a node joins a cluster, so it's the joining node that must supply the credentials.
+- _join-read-only_: user can join a cluster, but only as a read-only node.
 - _remove_: user can remove a node from a cluster.
 
 ### Example configuration file
@@ -59,17 +62,17 @@ An example configuration file is shown below.
   {
     "username": "mary",
     "password": "$2a$10$fKRHxrEuyDTP6tXIiDycr.nyC8Q7UMIfc31YMyXHDLgRDyhLK3VFS",
-    "perms": ["query", "backup"]
+    "perms": ["query", "backup", "join"]
   },
   {
     "username": "*",
-    "perms": ["status", "ready"]
+    "perms": ["status", "ready", "join-read-only"]
   }
 ]
 ```
 This configuration file sets authentication for three usernames, _bob_, _mary_, and `*`. It sets a password for the first two.
 
-This configuration also sets permissions for all usernames. _bob_ has permission to perform all operations, but _mary_ can only query the cluster, as well as backup the cluster. `*` is a special username, which indicates that all users -- even anonymous users (requests without any BasicAuth information) -- have permission to check the cluster and readiness. This can be useful if you wish to leave certain operations open to all accesses.
+This configuration also sets permissions for all usernames. _bob_ has permission to perform all operations, but _mary_ can only query the cluster, as well as backup and join the cluster. `*` is a special username, which indicates that all users -- even anonymous users (requests without any BasicAuth information) -- have permission to check the cluster status and readiness. All users can also join as a read-only node. This can be useful if you wish to leave certain operations open to all accesses.
 
 ## Secure cluster example
 Starting a node with HTTPS enabled, node-to-node encryption, and with the above configuration file. It is assumed the HTTPS X.509 certificate and key are at the paths `server.crt` and `key.pem` respectively, and the node-to-node certificate and key are at `node.crt` and `node-key.pem`
@@ -82,7 +85,7 @@ Bringing up a second node on the same host, joining it to the first node. This a
 ```bash
 rqlited -auth config.json -http-addr localhost:4003 -http-cert server.crt \
 -http-key key.pem -raft-addr :4004 -join https://bob:secret1@localhost:4001 \
--node-encrypt -node-cert node.crt -node-key node-key.pem -no-node-verify \
+-node-encrypt -node-cert node.crt -node-key node-key.pem -node-no-verify \
 ~/node.2
 ```
 Querying the node, as user _mary_.
@@ -96,6 +99,6 @@ The above example suffer from one shortcoming -- the password for user `bob` is 
 ```bash
 rqlited -auth config.json -http-addr localhost:4003 -http-cert server.crt \
 -http-key key.pem -raft-addr :4004 -join https://localhost:4001 -join-as bob \
--node-encrypt -node-cert node.crt -node-key node-key.pem -no-node-verify \
+-node-encrypt -node-cert node.crt -node-key node-key.pem -node-no-verify \
 ~/node.2
 ```

@@ -1,4 +1,6 @@
 # Command Line Interface
+> :warning: **This page is no longer maintained. Visit [rqlite.io](https://www.rqlite.io) for the latest docs.**
+
 rqlite comes with a CLI, which makes it easier to interact with a rqlite system. It is installed in the same directory as the node binary `rqlited`. Since rqlite is built on SQLite, you should consult the [SQLite query language documentation](https://www.sqlite.org/lang.html) for full details on what is supported.
 
 > **⚠ WARNING: Only enter one command at a time at CLI. Don't enter multiple commands at once, separated by ;**  
@@ -33,3 +35,6 @@ $ rqlite
 bye~
 ```
 You can connect the CLI to any node in a cluster, and it will automatically forward its requests to the leader if needed. Pass `-h` to `rqlite` to learn more.
+
+## History
+Command history is stored and reload between sessions, in a hidden file in the user's home directory named `.rqlite_history`. By default 100 previous commands are stored, though the value can be explicitly set via the environment variable `RQLITE_HISTFILESIZE`.

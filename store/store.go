@@ -30,13 +30,12 @@ import (
 )
 
 var (
+	// ErrNotOpen is returned when a Store is not open.
+	ErrNotOpen = errors.New("store not open")
+
 	// ErrNotLeader is returned when a node attempts to execute a leader-only
 	// operation.
 	ErrNotLeader = errors.New("not leader")
-
-	// ErrSelfJoin is returned when a join-request is received from a node
-	// with the same Raft ID as this node.
-	ErrSelfJoin = errors.New("self-join attempted")
 
 	// ErrStaleRead is returned if the executing the query would violate the
 	// requested freshness.
@@ -65,7 +64,7 @@ const (
 	connectionTimeout   = 10 * time.Second
 	raftLogCacheSize    = 512
 	trailingScale       = 1.25
-	observerChanLen     = 5 // Support any fast back-to-back leadership changes.
+	observerChanLen     = 50
 )
 
 const (
@@ -85,17 +84,9 @@ const (
 	snapshotDBOnDiskSize     = "snapshot_db_ondisk_size"
 	leaderChangesObserved    = "leader_changes_observed"
 	leaderChangesDropped     = "leader_changes_dropped"
-)
-
-// BackupFormat represents the format of database backup.
-type BackupFormat int
-
-const (
-	// BackupSQL is the plaintext SQL command format.
-	BackupSQL BackupFormat = iota
-
-	// BackupBinary is a SQLite file backup format.
-	BackupBinary
+	failedHeartbeatObserved  = "failed_heartbeat_observed"
+	nodesReapedOK            = "nodes_reaped_ok"
+	nodesReapedFailed        = "nodes_reaped_failed"
 )
 
 // stats captures stats for the Store.
@@ -103,6 +94,11 @@ var stats *expvar.Map
 
 func init() {
 	stats = expvar.NewMap("store")
+	ResetStats()
+}
+
+// ResetStats resets the expvar stats for this module. Mostly for test purposes.
+func ResetStats() {
 	stats.Add(numSnaphots, 0)
 	stats.Add(numBackups, 0)
 	stats.Add(numRestores, 0)
@@ -118,6 +114,9 @@ func init() {
 	stats.Add(snapshotDBOnDiskSize, 0)
 	stats.Add(leaderChangesObserved, 0)
 	stats.Add(leaderChangesDropped, 0)
+	stats.Add(failedHeartbeatObserved, 0)
+	stats.Add(nodesReapedOK, 0)
+	stats.Add(nodesReapedFailed, 0)
 }
 
 // ClusterState defines the possible Raft states the current node can be in
@@ -162,7 +161,7 @@ type Store struct {
 	raftStable    raft.StableStore          // Persistent k-v store.
 	boltStore     *rlog.Log                 // Physical store.
 
-	// Leader change observer
+	// Raft changes observer
 	leaderObserversMu sync.RWMutex
 	leaderObservers   []chan<- struct{}
 	observerClose     chan struct{}
@@ -206,12 +205,17 @@ type Store struct {
 	RaftLogger         hclog.Logger
 	NoFreeListSync     bool
 
+	// Node-reaping configuration
+	ReapTimeout         time.Duration
+	ReapReadOnlyTimeout time.Duration
+
 	numTrailingLogs uint64
 
 	// For whitebox testing
-	numNoops       int
-	numSnapshotsMu sync.Mutex
-	numSnapshots   int
+	numIgnoredJoins int
+	numNoops        int
+	numSnapshotsMu  sync.Mutex
+	numSnapshots    int
 }
 
 // IsNewNode returns whether a node using raftDir would be a brand-new node.
@@ -383,8 +387,9 @@ func (s *Store) Open() (retErr error) {
 	// Open the observer channels.
 	s.observerChan = make(chan raft.Observation, observerChanLen)
 	s.observer = raft.NewObserver(s.observerChan, false, func(o *raft.Observation) bool {
-		_, ok := o.Data.(raft.LeaderObservation)
-		return ok
+		_, isLeaderChange := o.Data.(raft.LeaderObservation)
+		_, isFailedHeartBeat := o.Data.(raft.FailedHeartbeatObservation)
+		return isLeaderChange || isFailedHeartBeat
 	})
 
 	// Register and listen for leader changes.
@@ -409,6 +414,17 @@ func (s *Store) Bootstrap(servers ...*Server) error {
 	})
 
 	return nil
+}
+
+// Stepdown forces this node to relinquish leadership to another node in
+// the cluster. If this node is not the leader, and 'wait' is true, an error
+// will be returned.
+func (s *Store) Stepdown(wait bool) error {
+	f := s.raft.LeadershipTransfer()
+	if !wait {
+		return nil
+	}
+	return f.(raft.Future).Error()
 }
 
 // Close closes the store. If wait is true, waits for a graceful shutdown.
@@ -530,8 +546,12 @@ func (s *Store) ID() string {
 }
 
 // LeaderAddr returns the address of the current leader. Returns a
-// blank string if there is no leader.
+// blank string if there is no leader or if the Store is not open.
 func (s *Store) LeaderAddr() (string, error) {
+	if !s.open {
+		return "", nil
+	}
+
 	return string(s.raft.Leader()), nil
 }
 
@@ -558,6 +578,10 @@ func (s *Store) LeaderID() (string, error) {
 
 // Nodes returns the slice of nodes in the cluster, sorted by ID ascending.
 func (s *Store) Nodes() ([]*Server, error) {
+	if !s.open {
+		return nil, ErrNotOpen
+	}
+
 	f := s.raft.GetConfiguration()
 	if f.Error() != nil {
 		return nil, f.Error()
@@ -633,6 +657,12 @@ func (s *Store) WaitForFSMIndex(idx uint64, timeout time.Duration) (uint64, erro
 
 // Stats returns stats for the store.
 func (s *Store) Stats() (map[string]interface{}, error) {
+	if !s.open {
+		return map[string]interface{}{
+			"open": false,
+		}, nil
+	}
+
 	fsmIdx := func() uint64 {
 		s.fsmIndexMu.RLock()
 		defer s.fsmIndexMu.RUnlock()
@@ -682,6 +712,7 @@ func (s *Store) Stats() (map[string]interface{}, error) {
 		return nil, err
 	}
 	status := map[string]interface{}{
+		"open":             s.open,
 		"node_id":          s.raftID,
 		"raft":             raftStats,
 		"fsm_index":        fsmIdx,
@@ -695,26 +726,32 @@ func (s *Store) Stats() (map[string]interface{}, error) {
 			"observed": s.observer.GetNumObserved(),
 			"dropped":  s.observer.GetNumDropped(),
 		},
-		"startup_on_disk":    s.StartupOnDisk,
-		"apply_timeout":      s.ApplyTimeout.String(),
-		"heartbeat_timeout":  s.HeartbeatTimeout.String(),
-		"election_timeout":   s.ElectionTimeout.String(),
-		"snapshot_threshold": s.SnapshotThreshold,
-		"snapshot_interval":  s.SnapshotInterval,
-		"no_freelist_sync":   s.NoFreeListSync,
-		"trailing_logs":      s.numTrailingLogs,
-		"request_marshaler":  s.reqMarshaller.Stats(),
-		"nodes":              nodes,
-		"dir":                s.raftDir,
-		"dir_size":           dirSz,
-		"sqlite3":            dbStatus,
-		"db_conf":            s.dbConf,
+		"startup_on_disk":        s.StartupOnDisk,
+		"apply_timeout":          s.ApplyTimeout.String(),
+		"heartbeat_timeout":      s.HeartbeatTimeout.String(),
+		"election_timeout":       s.ElectionTimeout.String(),
+		"snapshot_threshold":     s.SnapshotThreshold,
+		"snapshot_interval":      s.SnapshotInterval.String(),
+		"reap_timeout":           s.ReapTimeout.String(),
+		"reap_read_only_timeout": s.ReapReadOnlyTimeout.String(),
+		"no_freelist_sync":       s.NoFreeListSync,
+		"trailing_logs":          s.numTrailingLogs,
+		"request_marshaler":      s.reqMarshaller.Stats(),
+		"nodes":                  nodes,
+		"dir":                    s.raftDir,
+		"dir_size":               dirSz,
+		"sqlite3":                dbStatus,
+		"db_conf":                s.dbConf,
 	}
 	return status, nil
 }
 
 // Execute executes queries that return no rows, but do modify the database.
 func (s *Store) Execute(ex *command.ExecuteRequest) ([]*command.ExecuteResult, error) {
+	if !s.open {
+		return nil, ErrNotOpen
+	}
+
 	if s.raft.State() != raft.Leader {
 		return nil, ErrNotLeader
 	}
@@ -760,6 +797,10 @@ func (s *Store) execute(ex *command.ExecuteRequest) ([]*command.ExecuteResult, e
 
 // Query executes queries that return rows, and do not modify the database.
 func (s *Store) Query(qr *command.QueryRequest) ([]*command.QueryRows, error) {
+	if !s.open {
+		return nil, ErrNotOpen
+	}
+
 	if qr.Level == command.QueryRequest_QUERY_REQUEST_LEVEL_STRONG {
 		if s.raft.State() != raft.Leader {
 			return nil, ErrNotLeader
@@ -805,8 +846,8 @@ func (s *Store) Query(qr *command.QueryRequest) ([]*command.QueryRows, error) {
 		return nil, ErrNotLeader
 	}
 
-	if qr.Level == command.QueryRequest_QUERY_REQUEST_LEVEL_NONE && qr.Freshness > 0 &&
-		time.Since(s.raft.LastContact()).Nanoseconds() > qr.Freshness {
+	if s.raft.State() != raft.Leader && qr.Level == command.QueryRequest_QUERY_REQUEST_LEVEL_NONE &&
+		qr.Freshness > 0 && time.Since(s.raft.LastContact()).Nanoseconds() > qr.Freshness {
 		return nil, ErrStaleRead
 	}
 
@@ -822,37 +863,66 @@ func (s *Store) Query(qr *command.QueryRequest) ([]*command.QueryRows, error) {
 
 // Backup writes a snapshot of the underlying database to dst
 //
-// If leader is true, this operation is performed with a read consistency
-// level equivalent to "weak". Otherwise, no guarantees are made about the
-// read consistency level.
-func (s *Store) Backup(leader bool, fmt BackupFormat, dst io.Writer) error {
-	if leader && s.raft.State() != raft.Leader {
+// If Leader is true for the request, this operation is performed with a read consistency
+// level equivalent to "weak". Otherwise, no guarantees are made about the read consistency
+// level. This function is safe to call while the database is being changed.
+func (s *Store) Backup(br *command.BackupRequest, dst io.Writer) (retErr error) {
+	if !s.open {
+		return ErrNotOpen
+	}
+
+	startT := time.Now()
+	defer func() {
+		if retErr == nil {
+			stats.Add(numBackups, 1)
+			s.logger.Printf("database backed up in %s", time.Since(startT))
+		}
+	}()
+
+	if br.Leader && s.raft.State() != raft.Leader {
 		return ErrNotLeader
 	}
 
-	if fmt == BackupBinary {
-		if err := s.database(leader, dst); err != nil {
+	if br.Format == command.BackupRequest_BACKUP_REQUEST_FORMAT_BINARY {
+		f, err := ioutil.TempFile("", "rqlilte-snap-")
+		if err != nil {
 			return err
 		}
-	} else if fmt == BackupSQL {
-		if err := s.db.Dump(dst); err != nil {
+		if err := f.Close(); err != nil {
 			return err
 		}
-	} else {
-		return ErrInvalidBackupFormat
-	}
+		defer os.Remove(f.Name())
 
-	stats.Add(numBackups, 1)
-	return nil
+		if err := s.db.Backup(f.Name()); err != nil {
+			return err
+		}
+
+		of, err := os.Open(f.Name())
+		if err != nil {
+			return err
+		}
+		defer of.Close()
+
+		_, err = io.Copy(dst, of)
+		return err
+	} else if br.Format == command.BackupRequest_BACKUP_REQUEST_FORMAT_SQL {
+		return s.db.Dump(dst)
+	}
+	return ErrInvalidBackupFormat
 }
 
 // Loads an entire SQLite file into the database, sending the request
 // through the Raft log.
 func (s *Store) Load(lr *command.LoadRequest) error {
+	if !s.open {
+		return ErrNotOpen
+	}
+
 	startT := time.Now()
 
 	b, err := command.MarshalLoadRequest(lr)
 	if err != nil {
+		s.logger.Printf("load failed during load-request marshalling %s", err.Error())
 		return err
 	}
 
@@ -871,6 +941,7 @@ func (s *Store) Load(lr *command.LoadRequest) error {
 		if af.Error() == raft.ErrNotLeader {
 			return ErrNotLeader
 		}
+		s.logger.Printf("load failed during Apply: %s", af.Error())
 		return af.Error()
 	}
 
@@ -878,7 +949,7 @@ func (s *Store) Load(lr *command.LoadRequest) error {
 	s.dbAppliedIndex = af.Index()
 	s.dbAppliedIndexMu.Unlock()
 	stats.Add(numLoads, 1)
-	s.logger.Printf("node loaded in %s", time.Since(startT))
+	s.logger.Printf("node loaded with in %s (%d bytes)", time.Since(startT), len(b))
 	return af.Error()
 }
 
@@ -887,7 +958,13 @@ func (s *Store) Load(lr *command.LoadRequest) error {
 // bootstrapping will be attempted using this Store. "Expected level" includes
 // this node, so this node must self-notify to ensure the cluster bootstraps
 // with the *advertised Raft address* which the Store doesn't know about.
+//
+// Notifying is idempotent. A node may repeatedly notify the Store without issue.
 func (s *Store) Notify(id, addr string) error {
+	if !s.open {
+		return ErrNotOpen
+	}
+
 	s.notifyMu.Lock()
 	defer s.notifyMu.Unlock()
 
@@ -920,7 +997,7 @@ func (s *Store) Notify(id, addr string) error {
 	if bf.Error() != nil {
 		s.logger.Printf("cluster bootstrap failed: %s", bf.Error())
 	} else {
-		s.logger.Printf("cluster bootstrap successful")
+		s.logger.Printf("cluster bootstrap successful, servers: %s", raftServers)
 	}
 	s.bootstrapped = true
 	return nil
@@ -929,12 +1006,12 @@ func (s *Store) Notify(id, addr string) error {
 // Join joins a node, identified by id and located at addr, to this store.
 // The node must be ready to respond to Raft communications at that address.
 func (s *Store) Join(id, addr string, voter bool) error {
-	s.logger.Printf("received request from node with ID %s, at %s, to join this node", id, addr)
+	if !s.open {
+		return ErrNotOpen
+	}
+
 	if s.raft.State() != raft.Leader {
 		return ErrNotLeader
-	}
-	if id == s.raftID {
-		return ErrSelfJoin
 	}
 
 	configFuture := s.raft.GetConfiguration()
@@ -951,6 +1028,7 @@ func (s *Store) Join(id, addr string, voter bool) error {
 			// join is actually needed.
 			if srv.Address == raft.ServerAddress(addr) && srv.ID == raft.ServerID(id) {
 				stats.Add(numIgnoredJoins, 1)
+				s.numIgnoredJoins++
 				s.logger.Printf("node %s at %s already member of cluster, ignoring join request", id, addr)
 				return nil
 			}
@@ -983,11 +1061,15 @@ func (s *Store) Join(id, addr string, voter bool) error {
 	return nil
 }
 
-// Remove removes a node from the store, specified by ID.
-func (s *Store) Remove(id string) error {
+// Remove removes a node from the store.
+func (s *Store) Remove(rn *command.RemoveNodeRequest) error {
+	if !s.open {
+		return ErrNotOpen
+	}
+	id := rn.Id
+
 	s.logger.Printf("received request to remove node %s", id)
 	if err := s.remove(id); err != nil {
-		s.logger.Printf("failed to remove node %s: %s", id, err.Error())
 		return err
 	}
 
@@ -1166,7 +1248,7 @@ func (s *Store) Apply(l *raft.Log) (e interface{}) {
 // about the read consistency level.
 //
 // http://sqlite.org/howtocorrupt.html states it is safe to do this
-// as long as no transaction is in progress.
+// as long as the database is not written to during the call.
 func (s *Store) Database(leader bool) ([]byte, error) {
 	if leader && s.raft.State() != raft.Leader {
 		return nil, ErrNotLeader
@@ -1183,7 +1265,7 @@ func (s *Store) Database(leader bool) ([]byte, error) {
 // However, queries that involve a transaction must be blocked.
 //
 // http://sqlite.org/howtocorrupt.html states it is safe to copy or serialize the
-// database as long as no transaction is in progress.
+// database as long as no writes to the database are in progress.
 func (s *Store) Snapshot() (raft.FSMSnapshot, error) {
 	defer func() {
 		s.numSnapshotsMu.Lock()
@@ -1277,17 +1359,52 @@ func (s *Store) observe() (closeCh, doneCh chan struct{}) {
 		defer close(doneCh)
 		for {
 			select {
-			case <-s.observerChan:
-				s.leaderObserversMu.RLock()
-				for i := range s.leaderObservers {
-					select {
-					case s.leaderObservers[i] <- struct{}{}:
-						stats.Add(leaderChangesObserved, 1)
-					default:
-						stats.Add(leaderChangesDropped, 1)
+			case o := <-s.observerChan:
+				switch signal := o.Data.(type) {
+				case raft.FailedHeartbeatObservation:
+					stats.Add(failedHeartbeatObserved, 1)
+
+					nodes, err := s.Nodes()
+					if err != nil {
+						s.logger.Printf("failed to get nodes configuration during reap check: %s", err.Error())
 					}
+					servers := Servers(nodes)
+					id := string(signal.PeerID)
+					dur := time.Since(signal.LastContact)
+
+					isReadOnly, found := servers.IsReadOnly(id)
+					if !found {
+						s.logger.Printf("node %s is not present in configuration", id)
+						break
+					}
+
+					if (isReadOnly && s.ReapReadOnlyTimeout > 0 && dur > s.ReapReadOnlyTimeout) ||
+						(!isReadOnly && s.ReapTimeout > 0 && dur > s.ReapTimeout) {
+						pn := "voting node"
+						if isReadOnly {
+							pn = "non-voting node"
+						}
+						if err := s.remove(id); err != nil {
+							stats.Add(nodesReapedFailed, 1)
+							s.logger.Printf("failed to reap %s %s: %s", pn, id, err.Error())
+						} else {
+							stats.Add(nodesReapedOK, 1)
+							s.logger.Printf("successfully reaped %s %s", pn, id)
+						}
+					}
+				case raft.LeaderObservation:
+					s.leaderObserversMu.RLock()
+					for i := range s.leaderObservers {
+						select {
+						case s.leaderObservers[i] <- struct{}{}:
+							stats.Add(leaderChangesObserved, 1)
+						default:
+							stats.Add(leaderChangesDropped, 1)
+						}
+					}
+					s.leaderObserversMu.RUnlock()
 				}
-				s.leaderObserversMu.RUnlock()
+
 			case <-closeCh:
 				return
 			}
@@ -1303,34 +1420,6 @@ func (s *Store) logSize() (int64, error) {
 		return 0, err
 	}
 	return fi.Size(), nil
-}
-
-// Database copies contents of the underlying SQLite database to dst
-func (s *Store) database(leader bool, dst io.Writer) error {
-	if leader && s.raft.State() != raft.Leader {
-		return ErrNotLeader
-	}
-
-	f, err := ioutil.TempFile("", "rqlilte-snap-")
-	if err != nil {
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-
-	if err := s.db.Backup(f.Name()); err != nil {
-		return err
-	}
-
-	of, err := os.Open(f.Name())
-	if err != nil {
-		return err
-	}
-	defer of.Close()
-
-	_, err = io.Copy(dst, of)
-	return err
 }
 
 func (s *Store) databaseTypePretty() string {

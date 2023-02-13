@@ -141,19 +141,29 @@ class Node(object):
                http_cert=None, http_key=None, http_no_verify=False,
                node_cert=None, node_key=None, node_no_verify=False,
                auth=None, dir=None, on_disk=False):
+    
+    s_api = None
+    s_raft = None
     if api_addr is None:
-      s, addr = random_addr()
+      s_api, addr = random_addr()
       api_addr = addr
-      s.close()
     if raft_addr is None:
-      s, addr = random_addr()
+      s_raft, addr = random_addr()
       raft_addr = addr
-      s.close()
-    if dir is None:
-      dir = tempfile.mkdtemp()
+    
+    # Only now close any sockets used to get random addresses, so there is
+    # no chance a randomly selected address would get re-used by the HTTP
+    # system and Raft system.
+    if s_api is not None:
+        s_api.close()
+    if s_raft is not None:
+        s_raft.close()
+        
     if api_adv is None:
       api_adv = api_addr
-
+        
+    if dir is None:
+      dir = tempfile.mkdtemp()
     self.dir = dir
     self.path = path
     self.peers_path = os.path.join(self.dir, "raft/peers.json")
@@ -262,6 +272,7 @@ class Node(object):
     t = 0
     while wait:
       if t > timeout:
+        self.dump_log("dumping log due to timeout during start")
         raise Exception('rqlite process failed to start within %d seconds' % timeout)
       try:
         self.status()
@@ -328,15 +339,17 @@ class Node(object):
     except requests.exceptions.ConnectionError:
       return ''
 
-  def wait_for_leader(self, timeout=TIMEOUT):
+  def wait_for_leader(self, timeout=TIMEOUT, log=True):
     lr = None
     t = 0
     while lr == None or lr['addr'] == '':
       if t > timeout:
+        if log:
+          self.dump_log("dumping log due to timeout waiting for leader")
         raise Exception('rqlite node failed to detect leader within %d seconds' % timeout)
       try:
         lr = self.status()['store']['leader']
-      except requests.exceptions.ConnectionError:
+      except (KeyError, requests.exceptions.ConnectionError):
         pass
       time.sleep(1)
       t+=1
@@ -345,6 +358,13 @@ class Node(object):
     if self.ready() is not True:
       raise Exception('leader is available but node reports not ready')
     return lr
+
+  def expect_leader_fail(self, timeout=TIMEOUT):
+    try:
+      self.wait_for_leader(self, timeout, log=False)
+    except:
+      return True
+    return false
 
   def db_applied_index(self):
     return int(self.status()['store']['db_applied_index'])
@@ -435,7 +455,7 @@ class Node(object):
       t+=1
     return self.num_restores()
 
-  def query(self, statement, params=None, level='weak', pretty=False, text=False):
+  def query(self, statement, params=None, level='weak', pretty=False, text=False, associative=False):
     body = [statement]
     if params is not None:
       try:
@@ -447,6 +467,8 @@ class Node(object):
     reqParams = {'level': level}
     if pretty:
       reqParams['pretty'] = "yes"
+    if associative:
+      reqParams['associative'] = "yes"
     r = requests.post(self._query_url(), params=reqParams, data=json.dumps([body]))
     raise_for_status(r)
     if text:
@@ -486,6 +508,11 @@ class Node(object):
       raise_for_status(r)
       fd.write(r.content)
 
+  def remove_node(self, id):
+    body = {"id": id}
+    r = requests.delete(self._remove_url(), data=json.dumps(body))
+    raise_for_status(r)
+
   def restore(self, file, fmt=None):
     # This is the one API that doesn't expect JSON.
     if fmt != "binary":
@@ -493,12 +520,12 @@ class Node(object):
       r = requests.post(self._load_url(), data='\n'.join(conn.iterdump()))
       raise_for_status(r)
       conn.close()
+      return r.json()
     else:
       with open(file, 'rb') as f:
         data = f.read()
       r = requests.post(self._load_url(), data=data, headers={'Content-Type': 'application/octet-stream'})
       raise_for_status(r)
-    return r.json()
 
   def redirect_addr(self):
     r = requests.post(self._execute_url(redirect=True), data=json.dumps(['nonsense']), allow_redirects=False)
@@ -510,6 +537,13 @@ class Node(object):
     f = open(self.peers_path, "w")
     f.write(json.dumps(peers))
     f.close()
+
+  def dump_log(self, msg):
+    print(msg)
+    self.stderr_fd.close()
+    f = open(self.stderr_file, 'r')
+    for l in f.readlines():
+          print(l.strip())
 
   def _status_url(self):
     return 'http://' + self.APIAddr() + '/status'
@@ -541,6 +575,8 @@ class Node(object):
     return 'http://' + self.APIAddr() + '/db/backup'
   def _load_url(self):
     return 'http://' + self.APIAddr() + '/db/load'
+  def _remove_url(self):
+    return 'http://' + self.APIAddr() + '/remove'
   def __eq__(self, other):
     return self.node_id == other.node_id
   def __str__(self):
@@ -605,7 +641,6 @@ class TestSingleNode(unittest.TestCase):
     n0 = Node(RQLITED_PATH, '0',  raft_snap_threshold=2, raft_snap_int="1s")
     n0.start()
     n0.wait_for_leader()
-
     self.cluster = Cluster([n0])
 
   def tearDown(self):
@@ -616,15 +651,26 @@ class TestSingleNode(unittest.TestCase):
     n = self.cluster.wait_for_leader()
     j = n.execute('CREATE TABLE bar (id INTEGER NOT NULL PRIMARY KEY, name TEXT)')
     self.assertEqual(j, d_("{'results': [{}]}"))
+
     j = n.execute('INSERT INTO bar(name) VALUES("fiona")')
     applied = n.wait_for_all_fsm()
     self.assertEqual(j, d_("{'results': [{'last_insert_id': 1, 'rows_affected': 1}]}"))
     j = n.query('SELECT * from bar')
     self.assertEqual(j, d_("{'results': [{'values': [[1, 'fiona']], 'types': ['integer', 'text'], 'columns': ['id', 'name']}]}"))
 
+    j = n.execute('INSERT INTO bar(name) VALUES("declan")')
+    applied = n.wait_for_all_fsm()
+    self.assertEqual(j, d_("{'results': [{'last_insert_id': 2, 'rows_affected': 1}]}"))
+    j = n.query('SELECT * from bar where id=2')
+    self.assertEqual(j, d_("{'results': [{'values': [[2, 'declan']], 'types': ['integer', 'text'], 'columns': ['id', 'name']}]}"))
+
     # Ensure raw response from API is as expected.
     j = n.query('SELECT * from bar', text=True)
-    self.assertEqual(str(j), '{"results":[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"]]}]}')
+    self.assertEqual(str(j), '{"results":[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"],[2,"declan"]]}]}')
+
+    # Ensure raw associative response from API is as expected.
+    j = n.query('SELECT * from bar', text=True, associative=True)
+    self.assertEqual(str(j), '{"results":[{"types":{"id":"integer","name":"text"},"rows":[{"id":1,"name":"fiona"},{"id":2,"name":"declan"}]}]}')
 
   def test_simple_raw_queries_pretty(self):
     '''Test simple queries, requesting pretty output, work as expected'''
@@ -662,28 +708,44 @@ class TestSingleNode(unittest.TestCase):
     n = self.cluster.wait_for_leader()
     j = n.execute('CREATE TABLE bar (id INTEGER NOT NULL PRIMARY KEY, name TEXT, age INTEGER)')
     self.assertEqual(j, d_("{'results': [{}]}"))
+
     j = n.execute('INSERT INTO bar(name, age) VALUES(?,?)', params=["fiona", 20])
     applied = n.wait_for_all_fsm()
     self.assertEqual(j, d_("{'results': [{'last_insert_id': 1, 'rows_affected': 1}]}"))
-    j = n.query('SELECT * from bar')
-    self.assertEqual(j, d_("{'results': [{'values': [[1, 'fiona', 20]], 'types': ['integer', 'text', 'integer'], 'columns': ['id', 'name', 'age']}]}"))
+
+    j = n.execute('INSERT INTO bar(name, age) VALUES(?,?)', params=["declan", None])
+    applied = n.wait_for_all_fsm()
+    self.assertEqual(j, d_("{'results': [{'last_insert_id': 2, 'rows_affected': 1}]}"))
+
     j = n.query('SELECT * from bar WHERE age=?', params=[20])
     self.assertEqual(j, d_("{'results': [{'values': [[1, 'fiona', 20]], 'types': ['integer', 'text', 'integer'], 'columns': ['id', 'name', 'age']}]}"))
     j = n.query('SELECT * from bar WHERE age=?', params=[21])
     self.assertEqual(j, d_("{'results': [{'types': ['integer', 'text', 'integer'], 'columns': ['id', 'name', 'age']}]}"))
+    j = n.query('SELECT * from bar WHERE name=?', params=['declan'])
+    self.assertEqual(j, d_("{'results': [{'values': [[2, 'declan', None]], 'types': ['integer', 'text', 'integer'], 'columns': ['id', 'name', 'age']}]}"))
 
   def test_simple_named_parameterized_queries(self):
     '''Test named parameterized queries work as expected'''
     n = self.cluster.wait_for_leader()
     j = n.execute('CREATE TABLE bar (id INTEGER NOT NULL PRIMARY KEY, name TEXT, age INTEGER)')
     self.assertEqual(j, d_("{'results': [{}]}"))
+
     j = n.execute('INSERT INTO bar(name, age) VALUES(?,?)', params=["fiona", 20])
     applied = n.wait_for_all_fsm()
     self.assertEqual(j, d_("{'results': [{'last_insert_id': 1, 'rows_affected': 1}]}"))
+
     j = n.query('SELECT * from bar')
     self.assertEqual(j, d_("{'results': [{'values': [[1, 'fiona', 20]], 'types': ['integer', 'text', 'integer'], 'columns': ['id', 'name', 'age']}]}"))
+
     j = n.query('SELECT * from bar WHERE age=:age', params={"age": 20})
     self.assertEqual(j, d_("{'results': [{'values': [[1, 'fiona', 20]], 'types': ['integer', 'text', 'integer'], 'columns': ['id', 'name', 'age']}]}"))
+
+    j = n.execute('INSERT INTO bar(name, age) VALUES(?,?)', params=["declan", None])
+    applied = n.wait_for_all_fsm()
+    self.assertEqual(j, d_("{'results': [{'last_insert_id': 2, 'rows_affected': 1}]}"))
+
+    j = n.query('SELECT * from bar WHERE name=:name', params={"name": "declan"})
+    self.assertEqual(j, d_("{'results': [{'values': [[2, 'declan', None]], 'types': ['integer', 'text', 'integer'], 'columns': ['id', 'name', 'age']}]}"))
 
   def test_simple_parameterized_mixed_queries(self):
     '''Test a mix of parameterized and non-parameterized queries work as expected'''
@@ -723,10 +785,17 @@ class TestSingleNode(unittest.TestCase):
       time.sleep(1)
       t+=1
 
+class TestSingleNodeOnDisk(TestSingleNode):
+  def setUp(self):
+    n0 = Node(RQLITED_PATH, '0',  raft_snap_threshold=2, raft_snap_int="1s", on_disk=True)
+    n0.start()
+    n0.wait_for_leader()
+    self.cluster = Cluster([n0])
+
 class TestSingleNodeReadyz(unittest.TestCase):
   def test(self):
     ''' Test /readyz behaves correctly'''
-    n0 = Node(RQLITED_PATH, '0',  raft_snap_threshold=2, raft_snap_int="1s")
+    n0 = Node(RQLITED_PATH, '0')
     n0.start(join="http://nonsense")
     self.assertEqual(False, n0.ready())
     self.assertEqual(True, n0.ready(noleader=True))
@@ -764,14 +833,14 @@ class TestEndToEnd(unittest.TestCase):
   def test_full_restart(self):
     '''Test that a cluster can perform a full restart successfully'''
     self.cluster.wait_for_leader()
-    pids = self.cluster.pids()
+    pids = set(self.cluster.pids())
 
     self.cluster.stop()
     self.cluster.start()
     self.cluster.wait_for_leader()
     # Guard against any error in testing, by confirming that restarting the cluster
-    # actually resulted in new rqlite processes.
-    self.assertNotEqual(pids, self.cluster.pids())
+    # actually resulted in all new rqlited processes.
+    self.assertTrue(pids.isdisjoint(set(self.cluster.pids())))
 
   def test_execute_fail_rejoin(self):
     '''Test that a node that fails can rejoin the cluster, and picks up changes'''
@@ -840,6 +909,33 @@ class TestEndToEnd(unittest.TestCase):
     self.assertEqual(nodes[fs[1].node_id]['reachable'], True)
     self.assertEqual(nodes[l.node_id]['reachable'], True)
 
+  def test_remove_node_via_leader(self):
+    '''Test that removing a node via the leader works'''
+    l = self.cluster.wait_for_leader()
+    fs = self.cluster.followers()
+
+    # Validate state of cluster.
+    self.assertEqual(len(fs), 2)
+    nodes = l.nodes()
+    self.assertEqual(len(nodes), 3)
+
+    l.remove_node(fs[0].node_id)
+    nodes = l.nodes()
+    self.assertEqual(len(nodes), 2)
+
+  def test_remove_node_via_follower(self):
+    '''Test that removing a node via a follower works'''
+    l = self.cluster.wait_for_leader()
+    fs = self.cluster.followers()
+
+    # Validate state of cluster.
+    self.assertEqual(len(fs), 2)
+    nodes = l.nodes()
+    self.assertEqual(len(nodes), 3)
+
+    fs[0].remove_node(fs[1].node_id)
+    nodes = l.nodes()
+    self.assertEqual(len(nodes), 2)
 
 class TestEndToEndOnDisk(TestEndToEnd):
   def setUp(self):
@@ -948,7 +1044,7 @@ class TestBootstrapping(unittest.TestCase):
     self.assertEqual(n0.wait_for_leader(), n2.wait_for_leader())
 
     # Ensure a 4th node can join later, with same launch params.
-    n3 = Node(RQLITED_PATH, '1', boostrap_expect=3)
+    n3 = Node(RQLITED_PATH, '4', boostrap_expect=3)
     n3.start(join=','.join([n0.APIProtoAddr(), n1.APIProtoAddr(), n2.APIProtoAddr()]))
 
     n3.wait_for_leader()
@@ -1072,7 +1168,7 @@ class TestAuthJoin(unittest.TestCase):
 
     n1 = Node(RQLITED_PATH, '1', auth=self.auth_file.name)
     n1.start(join=n0.APIAddr())
-    self.assertRaises(Exception, n1.wait_for_leader) # Join should fail due to lack of auth.
+    self.assertTrue(n1.expect_leader_fail()) # Join should fail due to lack of auth.
 
     n2 = Node(RQLITED_PATH, '2', auth=self.auth_file.name)
     n2.start(join=n0.APIAddr(), join_as="foo")
@@ -1341,13 +1437,18 @@ class TestEndToEndBackupRestore(unittest.TestCase):
     fd, self.db_file = tempfile.mkstemp()
     os.close(fd)
 
+    # Create a two-node cluster.
     self.node0 = Node(RQLITED_PATH, '0')
     self.node0.start()
     self.node0.wait_for_leader()
     self.node0.execute('CREATE TABLE foo (id INTEGER NOT NULL PRIMARY KEY, name TEXT)')
     self.node0.execute('INSERT INTO foo(name) VALUES("fiona")')
     self.node0.wait_for_all_fsm()
+    self.node1 = Node(RQLITED_PATH, '1')
+    self.node1.start(join=self.node0.APIAddr())
+    self.node1.wait_for_leader()
 
+    # Get a backup from the first node and check it.
     self.node0.backup(self.db_file)
     conn = sqlite3.connect(self.db_file)
     rows = conn.execute('SELECT * FROM foo').fetchall()
@@ -1355,20 +1456,35 @@ class TestEndToEndBackupRestore(unittest.TestCase):
     self.assertEqual(rows[0], (1, 'fiona'))
     conn.close()
 
-    self.node1 = Node(RQLITED_PATH, '1')
-    self.node1.start()
-    self.node1.wait_for_leader()
-    j = self.node1.restore(self.db_file)
-    self.assertEqual(j, d_("{'results': [{'last_insert_id': 1, 'rows_affected': 1}]}"))
-    j = self.node1.query('SELECT * FROM foo')
-    self.assertEqual(j, d_("{'results': [{'values': [[1, 'fiona']], 'types': ['integer', 'text'], 'columns': ['id', 'name']}]}"))
+    # Get a backup from the other node and check it too.
+    self.node1.backup(self.db_file)
+    conn = sqlite3.connect(self.db_file)
+    rows = conn.execute('SELECT * FROM foo').fetchall()
+    self.assertEqual(len(rows), 1)
+    self.assertEqual(rows[0], (1, 'fiona'))
+    conn.close()
 
-    self.node2 = Node(RQLITED_PATH, '1')
+    # Load file into a brand new single node, check the data is right.
+    self.node2 = Node(RQLITED_PATH, '3')
     self.node2.start()
     self.node2.wait_for_leader()
-    j = self.node2.restore(self.db_file, fmt='binary')
-    self.assertEqual(j, d_("{'results': []}"))
+    j = self.node2.restore(self.db_file)
+    self.assertEqual(j, d_("{'results': [{'last_insert_id': 1, 'rows_affected': 1}]}"))
     j = self.node2.query('SELECT * FROM foo')
+    self.assertEqual(j, d_("{'results': [{'values': [[1, 'fiona']], 'types': ['integer', 'text'], 'columns': ['id', 'name']}]}"))
+
+    # Start another 2-node cluster, load data via follower and check.
+    self.node3 = Node(RQLITED_PATH, '3')
+    self.node3.start()
+    self.node3.wait_for_leader()
+    self.node4 = Node(RQLITED_PATH, '4')
+    self.node4.start(join=self.node3.APIAddr())
+    self.node4.wait_for_leader()
+    self.assertTrue(self.node3.is_leader())
+
+    self.node4.restore(self.db_file, fmt='binary')
+    self.node3.wait_for_all_fsm()
+    j = self.node3.query('SELECT * FROM foo')
     self.assertEqual(j, d_("{'results': [{'values': [[1, 'fiona']], 'types': ['integer', 'text'], 'columns': ['id', 'name']}]}"))
 
   def tearDown(self):
@@ -1376,6 +1492,12 @@ class TestEndToEndBackupRestore(unittest.TestCase):
       deprovision_node(self.node0)
     if hasattr(self, 'node1'):
       deprovision_node(self.node1)
+    if hasattr(self, 'node2'):
+      deprovision_node(self.node2)
+    if hasattr(self, 'node3'):
+      deprovision_node(self.node3)
+    if hasattr(self, 'node4'):
+      deprovision_node(self.node4)
     os.remove(self.db_file)
 
 class TestEndToEndSnapRestoreSingle(unittest.TestCase):
@@ -1442,7 +1564,6 @@ class TestEndToEndSnapRestoreCluster(unittest.TestCase):
       t+=1
 
   def test_join_with_snap(self):
-
     '''Check that a node joins a cluster correctly via a snapshot'''
     self.n0 = Node(RQLITED_PATH, '0',  raft_snap_threshold=100, raft_snap_int="1s")
     self.n0.start()

@@ -1,6 +1,8 @@
 package cluster
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -17,6 +19,8 @@ import (
 const (
 	initialPoolSize = 4
 	maxPoolCapacity = 64
+
+	protoBufferLengthSize = 8
 )
 
 // Client allows communicating with a remote node.
@@ -72,52 +76,12 @@ func (c *Client) GetNodeAPIAddr(nodeAddr string, timeout time.Duration) (string,
 	command := &Command{
 		Type: Command_COMMAND_TYPE_GET_NODE_API_URL,
 	}
-	p, err := proto.Marshal(command)
-	if err != nil {
-		return "", fmt.Errorf("command marshal: %s", err)
+	if err := writeCommand(conn, command, timeout); err != nil {
+		handleConnError(conn)
+		return "", err
 	}
 
-	// Write length of Protobuf
-	b := make([]byte, 4)
-	binary.LittleEndian.PutUint16(b[0:], uint16(len(p)))
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		handleConnError(conn)
-		return "", err
-	}
-	_, err = conn.Write(b)
-	if err != nil {
-		handleConnError(conn)
-		return "", fmt.Errorf("write protobuf length: %s", err)
-	}
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		handleConnError(conn)
-		return "", err
-	}
-	_, err = conn.Write(p)
-	if err != nil {
-		handleConnError(conn)
-		return "", fmt.Errorf("write protobuf: %s", err)
-	}
-
-	// Read length of response.
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		handleConnError(conn)
-		return "", err
-	}
-	_, err = io.ReadFull(conn, b)
-	if err != nil {
-		handleConnError(conn)
-		return "", err
-	}
-	sz := binary.LittleEndian.Uint16(b[0:])
-
-	// Read in the actual response.
-	p = make([]byte, sz)
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		handleConnError(conn)
-		return "", err
-	}
-	_, err = io.ReadFull(conn, p)
+	p, err := readResponse(conn, timeout)
 	if err != nil {
 		handleConnError(conn)
 		return "", err
@@ -132,8 +96,10 @@ func (c *Client) GetNodeAPIAddr(nodeAddr string, timeout time.Duration) (string,
 	return a.Url, nil
 }
 
-// Execute performs an Execute on a remote node.
-func (c *Client) Execute(er *command.ExecuteRequest, nodeAddr string, timeout time.Duration) ([]*command.ExecuteResult, error) {
+// Execute performs an Execute on a remote node. If username is an empty string
+// no credential information will be included in the Execute request to the
+// remote node.
+func (c *Client) Execute(er *command.ExecuteRequest, nodeAddr string, creds *Credentials, timeout time.Duration) ([]*command.ExecuteResult, error) {
 	conn, err := c.dial(nodeAddr, c.timeout)
 	if err != nil {
 		return nil, err
@@ -146,54 +112,14 @@ func (c *Client) Execute(er *command.ExecuteRequest, nodeAddr string, timeout ti
 		Request: &Command_ExecuteRequest{
 			ExecuteRequest: er,
 		},
+		Credentials: creds,
 	}
-	p, err := proto.Marshal(command)
-	if err != nil {
-		return nil, fmt.Errorf("command marshal: %s", err)
-	}
-
-	// Write length of Protobuf
-	b := make([]byte, 4)
-	binary.LittleEndian.PutUint16(b[0:], uint16(len(p)))
-
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		handleConnError(conn)
-		return nil, err
-	}
-	_, err = conn.Write(b)
-	if err != nil {
-		handleConnError(conn)
-		return nil, err
-	}
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		handleConnError(conn)
-		return nil, err
-	}
-	_, err = conn.Write(p)
-	if err != nil {
+	if err := writeCommand(conn, command, timeout); err != nil {
 		handleConnError(conn)
 		return nil, err
 	}
 
-	// Read length of response.
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		handleConnError(conn)
-		return nil, err
-	}
-	_, err = io.ReadFull(conn, b)
-	if err != nil {
-		handleConnError(conn)
-		return nil, err
-	}
-	sz := binary.LittleEndian.Uint32(b[0:])
-
-	// Read in the actual response.
-	p = make([]byte, sz)
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		handleConnError(conn)
-		return nil, err
-	}
-	_, err = io.ReadFull(conn, p)
+	p, err := readResponse(conn, timeout)
 	if err != nil {
 		handleConnError(conn)
 		return nil, err
@@ -212,7 +138,7 @@ func (c *Client) Execute(er *command.ExecuteRequest, nodeAddr string, timeout ti
 }
 
 // Query performs a Query on a remote node.
-func (c *Client) Query(qr *command.QueryRequest, nodeAddr string, timeout time.Duration) ([]*command.QueryRows, error) {
+func (c *Client) Query(qr *command.QueryRequest, nodeAddr string, creds *Credentials, timeout time.Duration) ([]*command.QueryRows, error) {
 	conn, err := c.dial(nodeAddr, c.timeout)
 	if err != nil {
 		return nil, err
@@ -225,51 +151,14 @@ func (c *Client) Query(qr *command.QueryRequest, nodeAddr string, timeout time.D
 		Request: &Command_QueryRequest{
 			QueryRequest: qr,
 		},
+		Credentials: creds,
 	}
-	p, err := proto.Marshal(command)
-	if err != nil {
-		return nil, fmt.Errorf("command marshal: %s", err)
-	}
-
-	// Write length of Protobuf, then the Protobuf
-	b := make([]byte, 4)
-	binary.LittleEndian.PutUint16(b[0:], uint16(len(p)))
-
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		handleConnError(conn)
-		return nil, err
-	}
-	_, err = conn.Write(b)
-	if err != nil {
-		handleConnError(conn)
-		return nil, err
-	}
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		handleConnError(conn)
-		return nil, err
-	}
-	_, err = conn.Write(p)
-	if err != nil {
+	if err := writeCommand(conn, command, timeout); err != nil {
 		handleConnError(conn)
 		return nil, err
 	}
 
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		handleConnError(conn)
-		return nil, err
-	}
-
-	// Read length of response.
-	_, err = io.ReadFull(conn, b)
-	if err != nil {
-		handleConnError(conn)
-		return nil, err
-	}
-	sz := binary.LittleEndian.Uint32(b[0:])
-
-	// Read in the actual response.
-	p = make([]byte, sz)
-	_, err = io.ReadFull(conn, p)
+	p, err := readResponse(conn, timeout)
 	if err != nil {
 		handleConnError(conn)
 		return nil, err
@@ -287,13 +176,141 @@ func (c *Client) Query(qr *command.QueryRequest, nodeAddr string, timeout time.D
 	return a.Rows, nil
 }
 
+// Backup retrieves a backup from a remote node and writes to the io.Writer
+func (c *Client) Backup(br *command.BackupRequest, nodeAddr string, creds *Credentials, timeout time.Duration, w io.Writer) error {
+	conn, err := c.dial(nodeAddr, c.timeout)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// Send the request
+	command := &Command{
+		Type: Command_COMMAND_TYPE_BACKUP,
+		Request: &Command_BackupRequest{
+			BackupRequest: br,
+		},
+		Credentials: creds,
+	}
+	if err := writeCommand(conn, command, timeout); err != nil {
+		handleConnError(conn)
+		return err
+	}
+
+	p, err := readResponse(conn, timeout)
+	if err != nil {
+		handleConnError(conn)
+		return err
+	}
+
+	// Decompress....
+	p, err = gzUncompress(p)
+	if err != nil {
+		handleConnError(conn)
+		return fmt.Errorf("backup decompress: %s", err)
+	}
+
+	resp := &CommandBackupResponse{}
+	err = proto.Unmarshal(p, resp)
+	if err != nil {
+		return fmt.Errorf("backup unmarshal: %s", err)
+	}
+
+	if resp.Error != "" {
+		return errors.New(resp.Error)
+	}
+
+	if _, err := w.Write(resp.Data); err != nil {
+		return fmt.Errorf("backup write: %s", err)
+	}
+	return nil
+}
+
+// Load loads a SQLite file into the database.
+func (c *Client) Load(lr *command.LoadRequest, nodeAddr string, creds *Credentials, timeout time.Duration) error {
+	conn, err := c.dial(nodeAddr, c.timeout)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// Create the request.
+	command := &Command{
+		Type: Command_COMMAND_TYPE_LOAD,
+		Request: &Command_LoadRequest{
+			LoadRequest: lr,
+		},
+		Credentials: creds,
+	}
+	if err := writeCommand(conn, command, timeout); err != nil {
+		handleConnError(conn)
+		return err
+	}
+
+	p, err := readResponse(conn, timeout)
+	if err != nil {
+		handleConnError(conn)
+		return err
+	}
+
+	a := &CommandLoadResponse{}
+	err = proto.Unmarshal(p, a)
+	if err != nil {
+		return err
+	}
+
+	if a.Error != "" {
+		return errors.New(a.Error)
+	}
+	return nil
+}
+
+// RemoveNode removes a node from the cluster
+func (c *Client) RemoveNode(rn *command.RemoveNodeRequest, nodeAddr string, creds *Credentials, timeout time.Duration) error {
+	conn, err := c.dial(nodeAddr, c.timeout)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// Create the request.
+	command := &Command{
+		Type: Command_COMMAND_TYPE_REMOVE_NODE,
+		Request: &Command_RemoveNodeRequest{
+			RemoveNodeRequest: rn,
+		},
+		Credentials: creds,
+	}
+	if err := writeCommand(conn, command, timeout); err != nil {
+		handleConnError(conn)
+		return err
+	}
+
+	p, err := readResponse(conn, timeout)
+	if err != nil {
+		handleConnError(conn)
+		return err
+	}
+
+	a := &CommandRemoveNodeResponse{}
+	err = proto.Unmarshal(p, a)
+	if err != nil {
+		return err
+	}
+
+	if a.Error != "" {
+		return errors.New(a.Error)
+	}
+	return nil
+}
+
 // Stats returns stats on the Client instance
 func (c *Client) Stats() (map[string]interface{}, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	stats := map[string]interface{}{
-		"timeout":         c.timeout,
+		"timeout":         c.timeout.String(),
 		"local_node_addr": c.localNodeAddr,
 	}
 
@@ -353,8 +370,76 @@ func (c *Client) dial(nodeAddr string, timeout time.Duration) (net.Conn, error) 
 	return conn, nil
 }
 
+func writeCommand(conn net.Conn, c *Command, timeout time.Duration) error {
+	p, err := proto.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("command marshal: %s", err)
+	}
+
+	// Write length of Protobuf
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return err
+	}
+	b := make([]byte, protoBufferLengthSize)
+	binary.LittleEndian.PutUint64(b[0:], uint64(len(p)))
+	_, err = conn.Write(b)
+	if err != nil {
+		return fmt.Errorf("write length: %s", err)
+	}
+	// Write actual protobuf.
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return err
+	}
+	_, err = conn.Write(p)
+	if err != nil {
+		return fmt.Errorf("write protobuf bytes: %s", err)
+	}
+	return nil
+}
+
+func readResponse(conn net.Conn, timeout time.Duration) ([]byte, error) {
+	// Read length of incoming response.
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, err
+	}
+	b := make([]byte, protoBufferLengthSize)
+	_, err := io.ReadFull(conn, b)
+	if err != nil {
+		return nil, fmt.Errorf("read protobuf length: %s", err)
+	}
+	sz := binary.LittleEndian.Uint64(b[0:])
+
+	// Read in the actual response.
+	p := make([]byte, sz)
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, err
+	}
+	_, err = io.ReadFull(conn, p)
+	if err != nil {
+		return nil, fmt.Errorf("read protobuf bytes: %s", err)
+	}
+	return p, nil
+}
+
 func handleConnError(conn net.Conn) {
 	if pc, ok := conn.(*pool.Conn); ok {
 		pc.MarkUnusable()
 	}
+}
+
+func gzUncompress(b []byte) ([]byte, error) {
+	gz, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal gzip NewReader: %s", err)
+	}
+
+	ub, err := io.ReadAll(gz)
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal gzip ReadAll: %s", err)
+	}
+
+	if err := gz.Close(); err != nil {
+		return nil, fmt.Errorf("unmarshal gzip Close: %s", err)
+	}
+	return ub, nil
 }
