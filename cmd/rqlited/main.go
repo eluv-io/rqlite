@@ -14,16 +14,18 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
-	consul "github.com/rqlite/rqlite-disco-clients/consul"
+	"github.com/rqlite/rqlite-disco-clients/consul"
 	"github.com/rqlite/rqlite-disco-clients/dns"
 	"github.com/rqlite/rqlite-disco-clients/dnssrv"
-	etcd "github.com/rqlite/rqlite-disco-clients/etcd"
+	"github.com/rqlite/rqlite-disco-clients/etcd"
 
 	"github.com/rqlite/rqlite/v7/auth"
 	"github.com/rqlite/rqlite/v7/cluster"
 	"github.com/rqlite/rqlite/v7/cmd"
+	"github.com/rqlite/rqlite/v7/db"
 	"github.com/rqlite/rqlite/v7/disco"
 	httpd "github.com/rqlite/rqlite/v7/http"
 	"github.com/rqlite/rqlite/v7/store"
@@ -54,9 +56,10 @@ func init() {
 
 func main() {
 	cfg, err := ParseFlags(name, desc, &BuildInfo{
-		Version: cmd.Version,
-		Commit:  cmd.Commit,
-		Branch:  cmd.Branch,
+		Version:       cmd.Version,
+		Commit:        cmd.Commit,
+		Branch:        cmd.Branch,
+		SQLiteVersion: db.DBVersion,
 	})
 	if err != nil {
 		log.Fatalf("failed to parse command-line flags: %s", err.Error())
@@ -66,8 +69,10 @@ func main() {
 	fmt.Printf(logo)
 
 	// Configure logging and pump out initial message.
-	log.Printf("%s starting, version %s, commit %s, branch %s, compiler %s", name, cmd.Version, cmd.Commit, cmd.Branch, runtime.Compiler)
-	log.Printf("%s, target architecture is %s, operating system target is %s", runtime.Version(), runtime.GOARCH, runtime.GOOS)
+	log.Printf("%s starting, version %s, SQLite %s, commit %s, branch %s, compiler %s", name, cmd.Version,
+		db.DBVersion, cmd.Commit, cmd.Branch, runtime.Compiler)
+	log.Printf("%s, target architecture is %s, operating system target is %s", runtime.Version(),
+		runtime.GOARCH, runtime.GOOS)
 	log.Printf("launch command: %s", strings.Join(os.Args, " "))
 
 	// Start requested profiling.
@@ -83,17 +88,12 @@ func main() {
 		log.Fatalf("failed to start node mux: %s", err.Error())
 	}
 	raftTn := mux.Listen(cluster.MuxRaftHeader)
-	log.Printf("Raft TCP mux Listener registered with %d", cluster.MuxRaftHeader)
+	log.Printf("Raft TCP mux Listener registered with byte header %d", cluster.MuxRaftHeader)
 
 	// Create the store.
 	str, err := createStore(cfg, raftTn)
 	if err != nil {
 		log.Fatalf("failed to create store: %s", err.Error())
-	}
-
-	// Now, open store.
-	if err := str.Open(); err != nil {
-		log.Fatalf("failed to open store: %s", err.Error())
 	}
 
 	// Get any credential store.
@@ -103,13 +103,15 @@ func main() {
 	}
 
 	// Create cluster service now, so nodes will be able to learn information about each other.
-	clstr, err := clusterService(cfg, mux.Listen(cluster.MuxClusterHeader), str)
+	clstr, err := clusterService(cfg, mux.Listen(cluster.MuxClusterHeader), str, str, credStr)
 	if err != nil {
 		log.Fatalf("failed to create cluster service: %s", err.Error())
 	}
-	log.Printf("cluster TCP mux Listener registered with %d", cluster.MuxClusterHeader)
+	log.Printf("cluster TCP mux Listener registered with byte header %d", cluster.MuxClusterHeader)
 
-	// Start the HTTP API server.
+	// We want to start the HTTP server as soon as possible, so the node is responsive and external
+	// systems can see that it's running. We still have to open the Store though, so the node won't
+	// be able to do much until that happens however.
 	clstrDialer := tcp.NewDialer(cluster.MuxClusterHeader, cfg.NodeEncrypt, cfg.NoNodeVerify)
 	clstrClient := cluster.NewClient(clstrDialer, cfg.ClusterConnectTimeout)
 	if err := clstrClient.SetLocal(cfg.RaftAdv, clstr); err != nil {
@@ -118,6 +120,12 @@ func main() {
 	httpServ, err := startHTTPService(cfg, str, clstrClient, credStr)
 	if err != nil {
 		log.Fatalf("failed to start HTTP server: %s", err.Error())
+	}
+	log.Printf("HTTP server started")
+
+	// Now, open store. How long this takes does depend on how much data is being stored by rqlite.
+	if err := str.Open(); err != nil {
+		log.Fatalf("failed to open store: %s", err.Error())
 	}
 
 	// Register remaining status providers.
@@ -152,8 +160,19 @@ func main() {
 
 	// Block until signalled.
 	terminate := make(chan os.Signal, 1)
-	signal.Notify(terminate, os.Interrupt)
+	signal.Notify(terminate, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-terminate
+
+	if cfg.RaftStepdownOnShutdown {
+		if str.IsLeader() {
+			// Don't log a confusing message if not (probably) Leader
+			log.Printf("stepping down as Leader before shutdown")
+		}
+		// Perform a stepdown, ignore any errors.
+		str.Stepdown(true)
+	}
+
+	httpServ.Close()
 	if err := str.Close(true); err != nil {
 		log.Printf("failed to close store: %s", err.Error())
 	}
@@ -191,6 +210,8 @@ func createStore(cfg *Config, ln *tcp.Layer) (*store.Store, error) {
 	str.ElectionTimeout = cfg.RaftElectionTimeout
 	str.ApplyTimeout = cfg.RaftApplyTimeout
 	str.BootstrapExpect = cfg.BootstrapExpect
+	str.ReapTimeout = cfg.RaftReapNodeTimeout
+	str.ReapReadOnlyTimeout = cfg.RaftReapReadOnlyNodeTimeout
 
 	isNew := store.IsNewNode(dataPath)
 	if isNew {
@@ -305,14 +326,14 @@ func credentialStore(cfg *Config) (*auth.CredentialsStore, error) {
 	}
 
 	cs := auth.NewCredentialsStore()
-	if cs.Load(f); err != nil {
+	if err = cs.Load(f); err != nil {
 		return nil, err
 	}
 	return cs, nil
 }
 
-func clusterService(cfg *Config, tn cluster.Transport, db cluster.Database) (*cluster.Service, error) {
-	c := cluster.New(tn, db)
+func clusterService(cfg *Config, tn cluster.Transport, db cluster.Database, mgr cluster.Manager, credStr *auth.CredentialsStore) (*cluster.Service, error) {
+	c := cluster.New(tn, db, mgr, credStr)
 	c.SetAPIAddr(cfg.HTTPAdv)
 	c.EnableHTTPS(cfg.X509Cert != "" && cfg.X509Key != "") // Conditions met for an HTTPS API
 
@@ -344,7 +365,7 @@ func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store
 		joiner.SetBasicAuth(cfg.JoinAs, pw)
 	}
 
-	// Prepare defintion of being part of a cluster.
+	// Prepare definition of being part of a cluster.
 	isClustered := func() bool {
 		leader, _ := str.LeaderAddr()
 		return leader != ""
@@ -361,14 +382,13 @@ func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store
 	}
 
 	if joins != nil && cfg.BootstrapExpect > 0 {
-		// Bootstrap with explicit join addresses requests.
 		if hasPeers {
 			log.Println("preexisting node configuration detected, ignoring bootstrap request")
 			return nil
 		}
 
-		bs := cluster.NewBootstrapper(cluster.NewAddressProviderString(joins),
-			cfg.BootstrapExpect, tlsConfig)
+		// Bootstrap with explicit join addresses requests.
+		bs := cluster.NewBootstrapper(cluster.NewAddressProviderString(joins), tlsConfig)
 		if cfg.JoinAs != "" {
 			pw, ok := credStr.Password(cfg.JoinAs)
 			if !ok {
@@ -389,7 +409,7 @@ func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store
 	switch cfg.DiscoMode {
 	case DiscoModeDNS, DiscoModeDNSSRV:
 		if hasPeers {
-			log.Printf("preexisting node configuration detected, ignoring %s", cfg.DiscoMode)
+			log.Printf("preexisting node configuration detected, ignoring %s option", cfg.DiscoMode)
 			return nil
 		}
 		rc := cfg.DiscoConfigReader()
@@ -418,7 +438,7 @@ func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store
 			provider = dnssrv.New(dnssrvCfg)
 		}
 
-		bs := cluster.NewBootstrapper(provider, cfg.BootstrapExpect, tlsConfig)
+		bs := cluster.NewBootstrapper(provider, tlsConfig)
 		if cfg.JoinAs != "" {
 			pw, ok := credStr.Password(cfg.JoinAs)
 			if !ok {

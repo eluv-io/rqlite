@@ -14,10 +14,10 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	consul "github.com/rqlite/rqlite-disco-clients/consul"
+	"github.com/rqlite/rqlite-disco-clients/consul"
 	"github.com/rqlite/rqlite-disco-clients/dns"
 	"github.com/rqlite/rqlite-disco-clients/dnssrv"
-	etcd "github.com/rqlite/rqlite-disco-clients/etcd"
+	"github.com/rqlite/rqlite-disco-clients/etcd"
 
 	"github.com/rqlite/rqlite/v7/auth"
 	"github.com/rqlite/rqlite/v7/cluster"
@@ -50,6 +50,18 @@ func (emb *Embedded) Start() (err error) {
 
 // Shutdown stops the daemon gracefully.
 func (emb *Embedded) Shutdown() (err error) {
+	if emb.Config.RaftStepdownOnShutdown {
+		if emb.store.IsLeader() {
+			// Don't log a confusing message if not (probably) Leader
+			log.Printf("stepping down as Leader before shutdown")
+		}
+		// Perform a stepdown, ignore any errors.
+		_ = emb.store.Stepdown(true)
+	}
+
+	if emb.httpdService != nil {
+		emb.httpdService.Close()
+	}
 	if emb.store != nil {
 		err = emb.store.Close(true)
 	}
@@ -58,9 +70,6 @@ func (emb *Embedded) Shutdown() (err error) {
 	}
 	if emb.raftListener != nil {
 		_ = emb.raftListener.Close()
-	}
-	if emb.httpdService != nil {
-		emb.httpdService.Close()
 	}
 	return err
 }
@@ -104,10 +113,6 @@ func New(config Config) (*Embedded, error) {
 	if err != nil {
 		return nil, errors.WithMessage(err, "create store")
 	}
-	// Now, open store.
-	if err := emb.store.Open(); err != nil {
-		return nil, errors.WithMessage(err, "open store")
-	}
 
 	// Get any credential store.
 	credStr, err := credentialStore(cfg)
@@ -116,7 +121,7 @@ func New(config Config) (*Embedded, error) {
 	}
 
 	// Create cluster service now, so nodes will be able to learn information about each other.
-	emb.cluster, err = clusterService(cfg, mux.Listen(cluster.MuxClusterHeader), emb.store)
+	emb.cluster, err = clusterService(cfg, mux.Listen(cluster.MuxClusterHeader), emb.store, emb.store, credStr)
 	if err != nil {
 		return nil, errors.WithMessage(err, "create cluster service")
 	}
@@ -131,6 +136,12 @@ func New(config Config) (*Embedded, error) {
 	emb.httpdService, err = startHTTPService(cfg, emb.store, clstrClient, credStr)
 	if err != nil {
 		return nil, errors.WithMessage(err, "start HTTP server")
+	}
+	log.Printf("HTTP server started")
+
+	// Now, open store.
+	if err := emb.store.Open(); err != nil {
+		return nil, errors.WithMessage(err, "open store")
 	}
 
 	// Register remaining status providers.
@@ -192,6 +203,8 @@ func createStore(cfg *Config, ln *tcp.Layer) (*store.Store, error) {
 	str.ElectionTimeout = cfg.RaftElectionTimeout
 	str.ApplyTimeout = cfg.RaftApplyTimeout
 	str.BootstrapExpect = cfg.BootstrapExpect
+	str.ReapTimeout = cfg.RaftReapNodeTimeout
+	str.ReapReadOnlyTimeout = cfg.RaftReapReadOnlyNodeTimeout
 
 	isNew := store.IsNewNode(dataPath)
 	if isNew {
@@ -322,8 +335,8 @@ func credentialStore(cfg *Config) (*auth.CredentialsStore, error) {
 	return cs, nil
 }
 
-func clusterService(cfg *Config, tn cluster.Transport, db cluster.Database) (*cluster.Service, error) {
-	c := cluster.New(tn, db)
+func clusterService(cfg *Config, tn cluster.Transport, db cluster.Database, mgr cluster.Manager, credStr *auth.CredentialsStore) (*cluster.Service, error) {
+	c := cluster.New(tn, db, mgr, credStr)
 	adaptLogger(cfg, c.Logger())
 	c.SetAPIAddr(cfg.HTTPAdv)
 	c.EnableHTTPS(cfg.X509Cert != "" && cfg.X509Key != "") // Conditions met for an HTTPS API
@@ -382,13 +395,13 @@ func createCluster(
 	}
 
 	if joins != nil && cfg.BootstrapExpect > 0 {
-		// Bootstrap with explicit join addresses requests.
 		if hasPeers {
 			log.Println("preexisting node configuration detected, ignoring bootstrap request")
 			return noop, nil
 		}
 
-		bs := cluster.NewBootstrapper(cluster.NewAddressProviderString(joins), cfg.BootstrapExpect, tlsConfig)
+		// Bootstrap with explicit join addresses requests.
+		bs := cluster.NewBootstrapper(cluster.NewAddressProviderString(joins), tlsConfig)
 		adaptLogger(cfg, bs.Logger())
 		adaptLogger(cfg, bs.JoinerLogger())
 		bs.Interval = cfg.BootstrapRetryInterval
@@ -444,7 +457,7 @@ func createCluster(
 			provider = dnssrv.New(dnssrvCfg)
 		}
 
-		bs := cluster.NewBootstrapper(provider, cfg.BootstrapExpect, tlsConfig)
+		bs := cluster.NewBootstrapper(provider, tlsConfig)
 		adaptLogger(cfg, bs.Logger())
 		bs.Interval = cfg.BootstrapRetryInterval
 		bs.MaxInterval = cfg.BootstrapRetryMaxInterval

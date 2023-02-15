@@ -20,6 +20,11 @@ const (
 	DiscoModeEtcdKV   = "etcd-kv"
 	DiscoModeDNS      = "dns"
 	DiscoModeDNSSRV   = "dns-srv"
+
+	HTTPAddrFlag    = "http-addr"
+	HTTPAdvAddrFlag = "http-adv-addr"
+	RaftAddrFlag    = "raft-addr"
+	RaftAdvAddrFlag = "raft-adv-addr"
 )
 
 // DefaultConfig returns the default rqlite configuration.
@@ -40,12 +45,13 @@ func DefaultConfig() Config {
 		RaftHeartbeatTimeout:      time.Second,
 		RaftElectionTimeout:       time.Second,
 		RaftApplyTimeout:          10 * time.Second,
+		RaftStepdownOnShutdown:    true,
 		RaftSnapThreshold:         8192,
 		RaftSnapInterval:          30 * time.Second,
 		RaftLogLevel:              "INFO",
 		ClusterConnectTimeout:     30 * time.Second,
-		WriteQueueCap:             128,
-		WriteQueueBatchSz:         16,
+		WriteQueueCap:             1024,
+		WriteQueueBatchSz:         128,
 		WriteQueueTimeout:         50 * time.Millisecond,
 		CompressionSize:           150,
 		CompressionBatch:          5,
@@ -187,7 +193,7 @@ type Config struct {
 	// RaftLeaderLeaseTimeout sets the leader lease timeout.
 	RaftLeaderLeaseTimeout time.Duration
 
-	// RaftHeartbeatTimeout sets the heartbeast timeout.
+	// RaftHeartbeatTimeout sets the heartbeat timeout.
 	RaftHeartbeatTimeout time.Duration
 
 	// RaftElectionTimeout sets the election timeout.
@@ -199,10 +205,21 @@ type Config struct {
 	// RaftShutdownOnRemove sets whether Raft should be shutdown if the node is removed
 	RaftShutdownOnRemove bool
 
+	// RaftStepdownOnShutdown sets whether Leadership should be relinquished on shutdown
+	RaftStepdownOnShutdown bool
+
 	// RaftNoFreelistSync disables syncing Raft database freelist to disk. When true,
 	// it improves the database write performance under normal operation, but requires
 	// a full database re-sync during recovery.
 	RaftNoFreelistSync bool
+
+	// RaftReapNodeTimeout sets the duration after which a non-reachable voting node is
+	// reaped i.e. removed from the cluster.
+	RaftReapNodeTimeout time.Duration
+
+	// RaftReapReadOnlyNodeTimeout sets the duration after which a non-reachable non-voting node is
+	// reaped i.e. removed from the cluster.
+	RaftReapReadOnlyNodeTimeout time.Duration
 
 	// ClusterConnectTimeout sets the timeout when initially connecting to another node in
 	// the cluster, for non-Raft communications.
@@ -264,14 +281,27 @@ func (c *Config) Validate() error {
 	if _, _, err := net.SplitHostPort(c.HTTPAddr); err != nil {
 		return errors.New("HTTP bind address not valid")
 	}
-	if _, _, err := net.SplitHostPort(c.HTTPAdv); err != nil {
-		return errors.New("HTTP advertised address not valid")
+
+	hadv, _, err := net.SplitHostPort(c.HTTPAdv)
+	if err != nil {
+		return errors.New("HTTP advertised HTTP address not valid")
 	}
+	if addr := net.ParseIP(hadv); addr != nil && addr.IsUnspecified() {
+		return fmt.Errorf("advertised HTTP address is not routable (%s), specify it via -%s or -%s",
+			hadv, HTTPAddrFlag, HTTPAdvAddrFlag)
+	}
+
 	if _, _, err := net.SplitHostPort(c.RaftAddr); err != nil {
 		return errors.New("raft bind address not valid")
 	}
-	if _, _, err := net.SplitHostPort(c.RaftAdv); err != nil {
+
+	radv, _, err := net.SplitHostPort(c.RaftAdv)
+	if err != nil {
 		return errors.New("raft advertised address not valid")
+	}
+	if addr := net.ParseIP(radv); addr != nil && addr.IsUnspecified() {
+		return fmt.Errorf("advertised Raft address is not routable (%s), specify it via -%s or -%s",
+			radv, RaftAddrFlag, RaftAdvAddrFlag)
 	}
 
 	// Enforce bootstrapping policies
@@ -354,7 +384,8 @@ func (c *Config) DiscoConfigReader() io.ReadCloser {
 
 // BuildInfo is build information for display at command line.
 type BuildInfo struct {
-	Version string
-	Commit  string
-	Branch  string
+	Version       string
+	Commit        string
+	Branch        string
+	SQLiteVersion string
 }

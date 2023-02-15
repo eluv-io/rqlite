@@ -42,6 +42,12 @@ func init() {
 	rand.Seed(time.Now().UnixNano())
 	DBVersion, _, _ = sqlite3.Version()
 	stats = expvar.NewMap("db")
+	ResetStats()
+}
+
+// ResetStats resets the expvar stats for this module. Mostly for test purposes.
+func ResetStats() {
+	stats.Init()
 	stats.Add(numExecutions, 0)
 	stats.Add(numExecutionErrors, 0)
 	stats.Add(numQueries, 0)
@@ -674,8 +680,8 @@ func (db *DB) Copy(dstDB *DB) error {
 // an ordinary on-disk database file, the serialization is just a copy of the
 // disk file. For an in-memory database or a "TEMP" database, the serialization
 // is the same sequence of bytes which would be written to disk if that database
-// were backed up to disk. This function must not be called while any transaction
-// is in progress.
+// were backed up to disk. This function must not be called while any writes
+// are happening to the database.
 func (db *DB) Serialize() ([]byte, error) {
 	if !db.memory {
 		// Simply read and return the SQLite file.
@@ -689,18 +695,14 @@ func (db *DB) Serialize() ([]byte, error) {
 	defer conn.Close()
 
 	var b []byte
-	f := func(driverConn interface{}) error {
-		c := driverConn.(*sqlite3.SQLiteConn)
-		b = c.Serialize("")
-		if b == nil {
-			return fmt.Errorf("failed to serialize database")
-		}
-		return nil
+	if err := conn.Raw(func(raw interface{}) error {
+		var err error
+		b, err = raw.(*sqlite3.SQLiteConn).Serialize("")
+		return err
+	}); err != nil {
+		return nil, fmt.Errorf("failed to serialize database: %s", err.Error())
 	}
 
-	if err := conn.Raw(f); err != nil {
-		return nil, err
-	}
 	return b, nil
 }
 
@@ -889,6 +891,8 @@ func parametersToValues(parameters []*command.Parameter) ([]interface{}, error) 
 			values[i] = sql.Named(parameters[i].GetName(), w.Y)
 		case *command.Parameter_S:
 			values[i] = sql.Named(parameters[i].GetName(), w.S)
+		case nil:
+			values[i] = nil
 		default:
 			return nil, fmt.Errorf("unsupported type: %T", w)
 		}

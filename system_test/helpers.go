@@ -122,39 +122,17 @@ func (n *Node) ExecuteQueuedMulti(stmts []string, wait bool) (string, error) {
 
 // Query runs a single query against the node.
 func (n *Node) Query(stmt string) (string, error) {
-	v, _ := url.Parse("http://" + n.APIAddr + "/db/query")
-	v.RawQuery = url.Values{"q": []string{stmt}}.Encode()
-
-	resp, err := http.Get(v.String())
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	return string(body), nil
+	return n.query(stmt, "weak")
 }
 
 // QueryNoneConsistency runs a single query against the node, with no read consistency.
 func (n *Node) QueryNoneConsistency(stmt string) (string, error) {
-	v, _ := url.Parse("http://" + n.APIAddr + "/db/query")
-	v.RawQuery = url.Values{
-		"q":     []string{stmt},
-		"level": []string{"none"},
-	}.Encode()
+	return n.query(stmt, "none")
+}
 
-	resp, err := http.Get(v.String())
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	return string(body), nil
+// QueryStrongConsistency runs a single query against the node, with Strong read consistency.
+func (n *Node) QueryStrongConsistency(stmt string) (string, error) {
+	return n.query(stmt, "strong")
 }
 
 // QueryMulti runs multiple queries against the node.
@@ -230,6 +208,16 @@ type NodesStatus map[string]struct {
 	Leader    bool   `json:"leader,omitempty"`
 }
 
+// HasAddr returns whether any node in the NodeStatus has the given Raft address.
+func (n NodesStatus) HasAddr(addr string) bool {
+	for i := range n {
+		if n[i].Addr == addr {
+			return true
+		}
+	}
+	return false
+}
+
 // Nodes returns the sNodes endpoint output for node.
 func (n *Node) Nodes(includeNonVoters bool) (NodesStatus, error) {
 	v, _ := url.Parse("http://" + n.APIAddr + "/nodes")
@@ -289,9 +277,26 @@ func (n *Node) Ready() (bool, error) {
 	return resp.StatusCode == 200, nil
 }
 
+// Liveness returns the viveness status for the node, primarily
+// for use by Kubernetes.
+func (n *Node) Liveness() (bool, error) {
+	v, _ := url.Parse("http://" + n.APIAddr + "/readyz?noleader")
+
+	resp, err := http.Get(v.String())
+	if err != nil {
+		return false, err
+	}
+	return resp.StatusCode == 200, nil
+}
+
 // Expvar returns the expvar output for node.
 func (n *Node) Expvar() (string, error) {
-	v, _ := url.Parse("http://" + n.APIAddr + "/debug/vars")
+	return n.ExpvarKey("")
+}
+
+// ExpvarKey returns the expvar output, for a given key, for a node.
+func (n *Node) ExpvarKey(k string) (string, error) {
+	v, _ := url.Parse("http://" + n.APIAddr + "/debug/vars?key=" + k)
 
 	resp, err := http.Get(v.String())
 	if err != nil {
@@ -348,6 +353,25 @@ func (n *Node) postExecuteQueued(stmt string, wait bool) (string, error) {
 	}
 
 	resp, err := http.Post("http://"+n.APIAddr+u, "application/json", strings.NewReader(stmt))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}
+
+func (n *Node) query(stmt, consistency string) (string, error) {
+	v, _ := url.Parse("http://" + n.APIAddr + "/db/query")
+	v.RawQuery = url.Values{
+		"q":     []string{stmt},
+		"level": []string{consistency},
+	}.Encode()
+
+	resp, err := http.Get(v.String())
 	if err != nil {
 		return "", err
 	}
@@ -594,7 +618,7 @@ func mustNodeEncryptedOnDisk(dir string, enableSingle, httpEncrypt bool, mux *tc
 	node.RaftAddr = node.Store.Addr()
 	node.ID = node.Store.ID()
 
-	clstr := cluster.New(mux.Listen(cluster.MuxClusterHeader), node.Store)
+	clstr := cluster.New(mux.Listen(cluster.MuxClusterHeader), node.Store, node.Store, mustNewMockCredentialStore())
 	if err := clstr.Open(); err != nil {
 		panic("failed to open Cluster service)")
 	}
@@ -712,7 +736,8 @@ func mustParseDuration(d string) time.Duration {
 }
 
 func asJSON(v interface{}) string {
-	b, err := encoding.JSONMarshal(v)
+	enc := encoding.Encoder{}
+	b, err := enc.JSONMarshal(v)
 	if err != nil {
 		panic(fmt.Sprintf("failed to JSON marshal value: %s", err.Error()))
 	}
@@ -882,4 +907,44 @@ func copyDir(src string, dst string) (err error) {
 	}
 
 	return
+}
+
+type mockCredentialStore struct {
+	HasPermOK bool
+	aaFunc    func(username, password, perm string) bool
+}
+
+func (m *mockCredentialStore) AA(username, password, perm string) bool {
+	if m == nil {
+		return true
+	}
+
+	if m.aaFunc != nil {
+		return m.aaFunc(username, password, perm)
+	}
+	return m.HasPermOK
+}
+
+func mustNewMockCredentialStore() *mockCredentialStore {
+	return &mockCredentialStore{HasPermOK: true}
+}
+
+// trueOrTimeout returns true if the given function returns true
+// within the timeout. Returns false otherwise.
+func trueOrTimeout(fn func() bool, dur time.Duration) bool {
+	timer := time.NewTimer(dur)
+	defer timer.Stop()
+	ticker := time.NewTicker(1000 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timer.C:
+			return false
+		case <-ticker.C:
+			if fn() {
+				return true
+			}
+		}
+	}
 }

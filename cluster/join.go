@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	httpd "github.com/rqlite/rqlite/v7/http"
+	rurl "github.com/rqlite/rqlite/v7/http/url"
 )
 
 var (
@@ -108,18 +108,23 @@ func (j *Joiner) Do(joinAddrs []string, id, addr string, voter bool) (string, er
 			if err == nil {
 				// Success!
 				return joinee, nil
+			} else {
+				j.logger.Printf("failed to join via node at %s: %s", a, err)
 			}
 		}
-		j.logger.Printf("failed to join cluster at %s: %s, sleeping %s before retry", joinAddrs, err.Error(), j.attemptInterval)
-		time.Sleep(j.attemptInterval)
+		if i+1 < j.numAttempts {
+			// This logic message only make sense if performing more than 1 join-attempt.
+			j.logger.Printf("failed to join cluster at %s, sleeping %s before retry", joinAddrs, j.attemptInterval)
+			time.Sleep(j.attemptInterval)
+		}
 	}
-	j.logger.Printf("failed to join cluster at %s, after %d attempts", joinAddrs, j.numAttempts)
+	j.logger.Printf("failed to join cluster at %s, after %d attempt(s)", joinAddrs, j.numAttempts)
 	return "", ErrJoinFailed
 }
 
 func (j *Joiner) join(joinAddr, id, addr string, voter bool) (string, error) {
 	// Check for protocol scheme, and insert default if necessary.
-	fullAddr := httpd.NormalizeAddr(fmt.Sprintf("%s/join", joinAddr))
+	fullAddr := rurl.NormalizeAddr(fmt.Sprintf("%s/join", joinAddr))
 
 	for {
 		b, err := json.Marshal(map[string]interface{}{
@@ -167,14 +172,14 @@ func (j *Joiner) join(joinAddr, id, addr string, voter bool) (string, error) {
 			// protocol a registered node is actually using.
 			if strings.HasPrefix(fullAddr, "https://") {
 				// It's already HTTPS, give up.
-				return "", fmt.Errorf("failed to join, node returned: %s: (%s)", resp.Status, string(b))
+				return "", fmt.Errorf("%s: (%s)", resp.Status, string(b))
 			}
 
 			j.logger.Print("join via HTTP failed, trying via HTTPS")
-			fullAddr = httpd.EnsureHTTPS(fullAddr)
+			fullAddr = rurl.EnsureHTTPS(fullAddr)
 			continue
 		default:
-			return "", fmt.Errorf("failed to join, node returned: %s: (%s)", resp.Status, string(b))
+			return "", fmt.Errorf("%s: (%s)", resp.Status, string(b))
 		}
 	}
 }

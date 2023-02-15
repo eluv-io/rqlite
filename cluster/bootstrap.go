@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	httpd "github.com/rqlite/rqlite/v7/http"
+	rurl "github.com/rqlite/rqlite/v7/http/url"
 )
 
 func init() {
@@ -35,7 +35,6 @@ type AddressProvider interface {
 // Bootstrapper performs a bootstrap of this node.
 type Bootstrapper struct {
 	provider  AddressProvider
-	expect    int
 	tlsConfig *tls.Config
 
 	joiner *Joiner
@@ -49,14 +48,13 @@ type Bootstrapper struct {
 }
 
 // NewBootstrapper returns an instance of a Bootstrapper.
-func NewBootstrapper(p AddressProvider, expect int, tlsConfig *tls.Config) *Bootstrapper {
+func NewBootstrapper(p AddressProvider, tlsConfig *tls.Config) *Bootstrapper {
 	bs := &Bootstrapper{
 		provider:    p,
-		expect:      expect,
 		tlsConfig:   &tls.Config{InsecureSkipVerify: true},
 		joiner:      NewJoiner("", 1, 0, tlsConfig),
 		logger:      log.New(os.Stderr, "[cluster-bootstrap] ", log.LstdFlags),
-		Interval:    5 * time.Second,
+		Interval:    2 * time.Second,
 		MaxInterval: 1 * time.Minute,
 	}
 	if tlsConfig != nil {
@@ -98,7 +96,6 @@ func (b *Bootstrapper) Boot(id, raftAddr string, done func() bool, timeout time.
 	defer tickerT.Stop()
 
 	interval := b.Interval
-	notifySuccess := false
 	for {
 		select {
 		case <-timeoutT.C:
@@ -121,26 +118,31 @@ func (b *Bootstrapper) Boot(id, raftAddr string, done func() bool, timeout time.
 			if err != nil {
 				b.logger.Printf("provider lookup failed %s", err.Error())
 			}
-			if len(targets) < b.expect {
+
+			if len(targets) == 0 {
 				continue
 			}
 
-			// Try an explicit join.
+			// Try an explicit join first. Joining an existing cluster is always given priority
+			// over trying to form a new cluster.
 			b.joiner.SetBasicAuth(b.username, b.password)
 			if j, err := b.joiner.Do(targets, id, raftAddr, true); err == nil {
 				b.logger.Printf("succeeded directly joining cluster via node at %s", j)
 				return nil
 			}
 
-			// Join didn't work, so perhaps perform a notify if we haven't done
-			// one yet.
-			if !notifySuccess {
-				if err := b.notify(targets, id, raftAddr); err != nil {
-					b.logger.Printf("failed to notify %s, retrying", targets)
-				} else {
-					b.logger.Printf("succeeded notifying %s", targets)
-					notifySuccess = true
-				}
+			// This is where we have to be careful. This node failed to join with any node
+			// in the targets list. This could be because none of the nodes are contactable,
+			// or none of the nodes are in a functioning cluster with a leader. That means that
+			// this node could be part of a set nodes that are bootstrapping to form a cluster
+			// de novo. For that to happen it needs to now let the otehr nodes know it is here.
+			// If this is a new cluster, some node will then reach the bootstrap-expect value,
+			// form the cluster, beating all other nodes to it.
+			if err := b.notify(targets, id, raftAddr); err != nil {
+				b.logger.Printf("failed to notify all targets: %s (%s, will retry)", targets,
+					err.Error())
+			} else {
+				b.logger.Printf("succeeded notifying all targets: %s", targets)
 			}
 		}
 	}
@@ -163,7 +165,7 @@ func (b *Bootstrapper) notify(targets []string, id, raftAddr string) error {
 
 	for _, t := range targets {
 		// Check for protocol scheme, and insert default if necessary.
-		fullTarget := httpd.NormalizeAddr(fmt.Sprintf("%s/notify", t))
+		fullTarget := rurl.NormalizeAddr(fmt.Sprintf("%s/notify", t))
 
 	TargetLoop:
 		for {
@@ -178,11 +180,13 @@ func (b *Bootstrapper) notify(targets []string, id, raftAddr string) error {
 
 			resp, err := client.Do(req)
 			if err != nil {
-				return err
+				return fmt.Errorf("failed to post notification to node at %s: %s",
+					rurl.RemoveBasicAuth(fullTarget), err)
 			}
 			resp.Body.Close()
 			switch resp.StatusCode {
 			case http.StatusOK:
+				b.logger.Printf("succeeded notifying target: %s", rurl.RemoveBasicAuth(fullTarget))
 				break TargetLoop
 			case http.StatusBadRequest:
 				// One possible cause is that the target server is listening for HTTPS, but
@@ -191,12 +195,13 @@ func (b *Bootstrapper) notify(targets []string, id, raftAddr string) error {
 				// record information about which protocol a registered node is actually using.
 				if strings.HasPrefix(fullTarget, "https://") {
 					// It's already HTTPS, give up.
-					return fmt.Errorf("failed to notify node at %s: %s", fullTarget, resp.Status)
+					return fmt.Errorf("failed to notify node at %s: %s", rurl.RemoveBasicAuth(fullTarget),
+						resp.Status)
 				}
-				fullTarget = httpd.EnsureHTTPS(fullTarget)
+				fullTarget = rurl.EnsureHTTPS(fullTarget)
 			default:
 				return fmt.Errorf("failed to notify node at %s: %s",
-					httpd.RemoveBasicAuth(fullTarget), resp.Status)
+					rurl.RemoveBasicAuth(fullTarget), resp.Status)
 			}
 
 		}

@@ -8,6 +8,10 @@ import (
 	"time"
 
 	"github.com/rqlite/rqlite/v7/cluster"
+	"github.com/rqlite/rqlite/v7/db"
+	"github.com/rqlite/rqlite/v7/http"
+	"github.com/rqlite/rqlite/v7/queue"
+	"github.com/rqlite/rqlite/v7/store"
 	"github.com/rqlite/rqlite/v7/tcp"
 )
 
@@ -162,6 +166,65 @@ func Test_MultiNodeCluster(t *testing.T) {
 	}
 }
 
+// Test_MultiNodeClusterRANDOM tests operation of RANDOM() SQL rewriting. It checks that a rewritten
+// statement is sent to follower.
+func Test_MultiNodeClusterRANDOM(t *testing.T) {
+	node1 := mustNewLeaderNode()
+	defer node1.Deprovision()
+
+	node2 := mustNewNode(false)
+	defer node2.Deprovision()
+	if err := node2.Join(node1); err != nil {
+		t.Fatalf("node failed to join leader: %s", err.Error())
+	}
+	_, err := node2.WaitForLeader()
+	if err != nil {
+		t.Fatalf("failed waiting for leader: %s", err.Error())
+	}
+
+	// Get the new leader, in case it changed.
+	c := Cluster{node1, node2}
+	leader, err := c.Leader()
+	if err != nil {
+		t.Fatalf("failed to find cluster leader: %s", err.Error())
+	}
+
+	_, err = leader.Execute("CREATE TABLE foo (id integer not null primary key, name text)")
+	if err != nil {
+		t.Fatalf("failed to create table: %s", err.Error())
+	}
+	_, err = leader.Execute(`INSERT INTO foo(id, name) VALUES(RANDOM(), "sinead")`)
+	if err != nil {
+		t.Fatalf("failed to INSERT record: %s", err.Error())
+	}
+	r, err := leader.Query("SELECT COUNT(*) FROM foo")
+	if err != nil {
+		t.Fatalf("failed to query for count: %s", err.Error())
+	}
+	if got, exp := r, `{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[1]]}]}`; got != exp {
+		t.Fatalf("wrong query results, exp %s, got %s", exp, got)
+	}
+
+	// Send a few Noops through to ensure SQLite database has been updated on each node.
+	for i := 0; i < 5; i++ {
+		node1.Noop("some_id")
+	}
+
+	// Check that row is *exactly* the same on each node. This could only happen if RANDOM was
+	// rewritten by the Leader before committing to the Raft log.
+	r1, err := node1.QueryNoneConsistency("SELECT * FROM foo")
+	if err != nil {
+		t.Fatalf("failed to query node 1: %s", err.Error())
+	}
+	r2, err := node2.QueryNoneConsistency("SELECT * FROM foo")
+	if err != nil {
+		t.Fatalf("failed to query node 2: %s", err.Error())
+	}
+	if r1 != r2 {
+		t.Fatalf("node 1 and node 2 do not have the same data (%s %s)", r1, r2)
+	}
+}
+
 // Test_MultiNodeClusterBootstrap tests formation of a 3-node cluster via bootstraping,
 // and its operation.
 func Test_MultiNodeClusterBootstrap(t *testing.T) {
@@ -179,9 +242,9 @@ func Test_MultiNodeClusterBootstrap(t *testing.T) {
 
 	provider := cluster.NewAddressProviderString(
 		[]string{node1.APIAddr, node2.APIAddr, node3.APIAddr})
-	node1Bs := cluster.NewBootstrapper(provider, 3, nil)
-	node2Bs := cluster.NewBootstrapper(provider, 3, nil)
-	node3Bs := cluster.NewBootstrapper(provider, 3, nil)
+	node1Bs := cluster.NewBootstrapper(provider, nil)
+	node2Bs := cluster.NewBootstrapper(provider, nil)
+	node3Bs := cluster.NewBootstrapper(provider, nil)
 
 	// Have all nodes start a bootstrap basically in parallel,
 	// ensure only 1 leader actually gets elected.
@@ -223,6 +286,21 @@ func Test_MultiNodeClusterBootstrap(t *testing.T) {
 	leader, err := c.Leader()
 	if err != nil {
 		t.Fatalf("failed to find cluster leader: %s", err.Error())
+	}
+
+	// Ensure each node has the same leader!
+	leaderAddr, err := leader.WaitForLeader()
+	if err != nil {
+		t.Fatalf("failed to find cluster leader: %s", err.Error())
+	}
+	for i, n := range []*Node{node1, node2, node3} {
+		addr, err := n.WaitForLeader()
+		if err != nil {
+			t.Fatalf("failed waiting for a leader on node %d: %s", i, err.Error())
+		}
+		if exp, got := leaderAddr, addr; exp != got {
+			t.Fatalf("node %d has wrong leader, exp %s, got %s", i, exp, got)
+		}
 	}
 
 	// Run queries against cluster.
@@ -329,11 +407,11 @@ func Test_MultiNodeClusterBootstrapLaterJoin(t *testing.T) {
 
 	provider := cluster.NewAddressProviderString(
 		[]string{node1.APIAddr, node2.APIAddr, node3.APIAddr})
-	node1Bs := cluster.NewBootstrapper(provider, 3, nil)
+	node1Bs := cluster.NewBootstrapper(provider, nil)
 	node1Bs.Interval = time.Second
-	node2Bs := cluster.NewBootstrapper(provider, 3, nil)
+	node2Bs := cluster.NewBootstrapper(provider, nil)
 	node2Bs.Interval = time.Second
-	node3Bs := cluster.NewBootstrapper(provider, 3, nil)
+	node3Bs := cluster.NewBootstrapper(provider, nil)
 	node3Bs.Interval = time.Second
 
 	// Have all nodes start a bootstrap basically in parallel,
@@ -392,7 +470,7 @@ func Test_MultiNodeClusterBootstrapLaterJoin(t *testing.T) {
 	node4 := mustNewNode(false)
 	node4.Store.BootstrapExpect = 3
 	defer node3.Deprovision()
-	node4Bs := cluster.NewBootstrapper(provider, 3, nil)
+	node4Bs := cluster.NewBootstrapper(provider, nil)
 	node4Bs.Interval = time.Second
 	done := func() bool {
 		addr, _ := node4.Store.LeaderAddr()
@@ -427,11 +505,11 @@ func Test_MultiNodeClusterBootstrapLaterJoinHTTPS(t *testing.T) {
 
 	provider := cluster.NewAddressProviderString(
 		[]string{node1.APIAddr, node2.APIAddr, node3.APIAddr})
-	node1Bs := cluster.NewBootstrapper(provider, 3, nil)
+	node1Bs := cluster.NewBootstrapper(provider, nil)
 	node1Bs.Interval = time.Second
-	node2Bs := cluster.NewBootstrapper(provider, 3, nil)
+	node2Bs := cluster.NewBootstrapper(provider, nil)
 	node2Bs.Interval = time.Second
-	node3Bs := cluster.NewBootstrapper(provider, 3, nil)
+	node3Bs := cluster.NewBootstrapper(provider, nil)
 	node3Bs.Interval = time.Second
 
 	// Have all nodes start a bootstrap basically in parallel,
@@ -490,7 +568,7 @@ func Test_MultiNodeClusterBootstrapLaterJoinHTTPS(t *testing.T) {
 	node4 := mustNewNodeEncrypted(false, true, true)
 	node4.Store.BootstrapExpect = 3
 	defer node3.Deprovision()
-	node4Bs := cluster.NewBootstrapper(provider, 3, nil)
+	node4Bs := cluster.NewBootstrapper(provider, nil)
 	node4Bs.Interval = time.Second
 	done := func() bool {
 		addr, _ := node4.Store.LeaderAddr()
@@ -698,7 +776,7 @@ func Test_MultiNodeClusterQueuedWrites(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < writesPerLoop; i++ {
 			if _, err := node1.Execute(`INSERT INTO foo(name) VALUES("fiona")`); err != nil {
-				t.Fatalf("failed to create table: %s", err.Error())
+				t.Logf("failed to insert records: %s", err.Error())
 			}
 		}
 	}()
@@ -706,7 +784,7 @@ func Test_MultiNodeClusterQueuedWrites(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < writesPerLoop; i++ {
 			if _, err := node2.Execute(`INSERT INTO foo(name) VALUES("fiona")`); err != nil {
-				t.Fatalf("failed to create table: %s", err.Error())
+				t.Logf("failed to insert records: %s", err.Error())
 			}
 		}
 	}()
@@ -714,38 +792,104 @@ func Test_MultiNodeClusterQueuedWrites(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < writesPerLoop-1; i++ {
 			if _, err := node2.ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, false); err != nil {
-				t.Fatalf("failed to create table: %s", err.Error())
+				t.Logf("failed to insert records: %s", err.Error())
 			}
 		}
 		if _, err := node2.ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, true); err != nil {
-			t.Fatalf("failed to create table: %s", err.Error())
+			t.Logf("failed to insert records: %s", err.Error())
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		for i := 0; i < writesPerLoop-1; i++ {
 			if _, err := node3.ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, false); err != nil {
-				t.Fatalf("failed to create table: %s", err.Error())
+				t.Logf("failed to insert records: %s", err.Error())
 			}
 		}
 		if _, err := node3.ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, true); err != nil {
-			t.Fatalf("failed to create table: %s", err.Error())
+			t.Logf("failed to insert records: %s", err.Error())
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		for i := 0; i < writesPerLoop-1; i++ {
 			if _, err := node3.ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, false); err != nil {
-				t.Fatalf("failed to create table: %s", err.Error())
+				t.Logf("failed to insert records: %s", err.Error())
 			}
 		}
 		if _, err := node3.ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, true); err != nil {
-			t.Fatalf("failed to create table: %s", err.Error())
+			t.Logf("failed to insert records: %s", err.Error())
 		}
 	}()
 	wg.Wait()
 
 	exp := fmt.Sprintf(`{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[%d]]}]}`, 5*writesPerLoop)
+	got, err := node1.Query(`SELECT COUNT(*) FROM foo`)
+	if err != nil {
+		t.Fatalf("failed to query follower node: %s", err.Error())
+	}
+	if got != exp {
+		t.Fatalf("incorrect count, got %s, exp %s", got, exp)
+	}
+}
+
+// Test_MultiNodeClusterLargeQueuedWrites tests writing to a cluster using
+// many large concurrent Queued Writes operations.
+func Test_MultiNodeClusterLargeQueuedWrites(t *testing.T) {
+	store.ResetStats()
+	db.ResetStats()
+	http.ResetStats()
+	queue.ResetStats()
+
+	node1 := mustNewLeaderNode()
+	defer node1.Deprovision()
+
+	if _, err := node1.Execute(`CREATE TABLE foo (id integer not null primary key, name text)`); err != nil {
+		t.Fatalf("failed to create table: %s", err.Error())
+	}
+
+	// Join a second and third nodes
+	node2 := mustNewNode(false)
+	defer node2.Deprovision()
+	if err := node2.Join(node1); err != nil {
+		t.Fatalf("node failed to join leader: %s", err.Error())
+	}
+	_, err := node2.WaitForLeader()
+	if err != nil {
+		t.Fatalf("failed waiting for leader: %s", err.Error())
+	}
+	node3 := mustNewNode(false)
+	defer node3.Deprovision()
+	if err := node3.Join(node1); err != nil {
+		t.Fatalf("node failed to join leader: %s", err.Error())
+	}
+	_, err = node3.WaitForLeader()
+	if err != nil {
+		t.Fatalf("failed waiting for leader: %s", err.Error())
+	}
+
+	// Write data to the cluster, via various nodes.
+	nodesUnderTest := []*Node{node3, node1, node2, node1, node2, node3, node1, node3, node2}
+	writesPerNode := 10000
+
+	var wg sync.WaitGroup
+	wg.Add(len(nodesUnderTest))
+	for _, n := range nodesUnderTest {
+		go func(nt *Node) {
+			defer wg.Done()
+			for i := 0; i < writesPerNode-1; i++ {
+				if _, err := nt.ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, false); err != nil {
+					t.Logf("failed to insert records: %s", err.Error())
+				}
+			}
+			if _, err := nt.ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, true); err != nil {
+				t.Logf("failed to insert records: %s", err.Error())
+			}
+		}(n)
+	}
+	wg.Wait()
+
+	exp := fmt.Sprintf(`{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[%d]]}]}`, len(nodesUnderTest)*writesPerNode)
 	got, err := node1.Query(`SELECT COUNT(*) FROM foo`)
 	if err != nil {
 		t.Fatalf("failed to query follower node: %s", err.Error())
@@ -1367,4 +1511,285 @@ func Test_MultiNodeClusterRecoverFull(t *testing.T) {
 	if rows, _ := node4.Query(`SELECT COUNT(*) FROM foo`); rows != `{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[1]]}]}` {
 		t.Fatalf("got incorrect results from recovered node: %s", rows)
 	}
+}
+
+// Test_MultiNodeClusterReapNodes tests that unreachable nodes are reaped.
+func Test_MultiNodeClusterReapNodes(t *testing.T) {
+	cfgStoreFn := func(n *Node) {
+		n.Store.ReapTimeout = time.Second
+		n.Store.ReapReadOnlyTimeout = time.Second
+	}
+
+	node1 := mustNewLeaderNode()
+	defer node1.Deprovision()
+	cfgStoreFn(node1)
+	_, err := node1.WaitForLeader()
+	if err != nil {
+		t.Fatalf("failed waiting for leader: %s", err.Error())
+	}
+
+	node2 := mustNewNode(false)
+	defer node2.Deprovision()
+	cfgStoreFn(node2)
+	if err := node2.Join(node1); err != nil {
+		t.Fatalf("node failed to join leader: %s", err.Error())
+	}
+	_, err = node2.WaitForLeader()
+	if err != nil {
+		t.Fatalf("failed waiting for leader: %s", err.Error())
+	}
+
+	// Get the new leader, in case it changed.
+	c := Cluster{node1, node2}
+	leader, err := c.Leader()
+	if err != nil {
+		t.Fatalf("failed to find cluster leader: %s", err.Error())
+	}
+
+	node3 := mustNewNode(false)
+	defer node3.Deprovision()
+	cfgStoreFn(node3)
+	if err := node3.Join(leader); err != nil {
+		t.Fatalf("node failed to join leader: %s", err.Error())
+	}
+	_, err = node3.WaitForLeader()
+	if err != nil {
+		t.Fatalf("failed waiting for leader: %s", err.Error())
+	}
+
+	// Get the new leader, in case it changed.
+	c = Cluster{node1, node2, node3}
+	leader, err = c.Leader()
+	if err != nil {
+		t.Fatalf("failed to find cluster leader: %s", err.Error())
+	}
+
+	nonVoter := mustNewNode(false)
+	defer nonVoter.Deprovision()
+	cfgStoreFn(nonVoter)
+	if err := nonVoter.JoinAsNonVoter(leader); err != nil {
+		t.Fatalf("non-voting node failed to join leader: %s", err.Error())
+	}
+	_, err = nonVoter.WaitForLeader()
+	if err != nil {
+		t.Fatalf("failed waiting for leader: %s", err.Error())
+	}
+	c = Cluster{node1, node2, node3, nonVoter}
+
+	// Confirm non-voter node is in the the cluster config.
+	nodes, err := leader.Nodes(true)
+	if err != nil {
+		t.Fatalf("failed to get nodes: %s", err.Error())
+	}
+	if !nodes.HasAddr(nonVoter.RaftAddr) {
+		t.Fatalf("nodes do not contain non-voter node")
+	}
+
+	// Kill non-voter node, confirm it's removed.
+	nonVoter.Deprovision()
+	tFn := func() bool {
+		nodes, _ = leader.Nodes(true)
+		return !nodes.HasAddr(nonVoter.RaftAddr)
+	}
+	if !trueOrTimeout(tFn, 20*time.Second) {
+		t.Fatalf("timed out waiting for non-voting node to be reaped")
+	}
+
+	// Confirm voting node is in the the cluster config.
+	nodes, err = leader.Nodes(true)
+	if err != nil {
+		t.Fatalf("failed to get nodes: %s", err.Error())
+	}
+	if !nodes.HasAddr(node3.RaftAddr) {
+		t.Fatalf("nodes do not contain non-voter node")
+	}
+
+	// Kill voting node, confirm it's removed.
+	node3.Deprovision()
+	tFn = func() bool {
+		nodes, _ = leader.Nodes(true)
+		return !nodes.HasAddr(node3.RaftAddr)
+	}
+
+	if !trueOrTimeout(tFn, 20*time.Second) {
+		t.Fatalf("timed out waiting for voting node to be reaped")
+	}
+}
+
+// Test_MultiNodeClusterNoReap tests that a node is not reaped before
+// its time.
+func Test_MultiNodeClusterNoReap(t *testing.T) {
+	cfgStoreFn := func(n *Node) {
+		n.Store.ReapReadOnlyTimeout = 120 * time.Second
+	}
+
+	node1 := mustNewLeaderNode()
+	defer node1.Deprovision()
+	cfgStoreFn(node1)
+	_, err := node1.WaitForLeader()
+	if err != nil {
+		t.Fatalf("failed waiting for leader: %s", err.Error())
+	}
+
+	nonVoter := mustNewNode(false)
+	defer nonVoter.Deprovision()
+	cfgStoreFn(nonVoter)
+	if err := nonVoter.JoinAsNonVoter(node1); err != nil {
+		t.Fatalf("non-voting node failed to join leader: %s", err.Error())
+	}
+	_, err = nonVoter.WaitForLeader()
+	if err != nil {
+		t.Fatalf("failed waiting for leader: %s", err.Error())
+	}
+
+	// Confirm non-voter node is in the the cluster config.
+	nodes, err := node1.Nodes(true)
+	if err != nil {
+		t.Fatalf("failed to get nodes: %s", err.Error())
+	}
+	if !nodes.HasAddr(nonVoter.RaftAddr) {
+		t.Fatalf("nodes do not contain non-voter node")
+	}
+
+	// Kill non-voter node, confirm it's not removed.
+	nonVoter.Deprovision()
+	tFn := func() bool {
+		nodes, _ = node1.Nodes(true)
+		return !nodes.HasAddr(nonVoter.RaftAddr)
+	}
+	if trueOrTimeout(tFn, 20*time.Second) {
+		t.Fatalf("didn't time out waiting for node to be removed")
+	}
+}
+
+// Test_MultiNodeClusterNoReapZero tests that unreachable nodes are reaped.
+func Test_MultiNodeClusterNoReapZero(t *testing.T) {
+	cfgStoreFn := func(n *Node) {
+		n.Store.ReapTimeout = 0
+	}
+
+	node1 := mustNewLeaderNode()
+	defer node1.Deprovision()
+	cfgStoreFn(node1)
+	_, err := node1.WaitForLeader()
+	if err != nil {
+		t.Fatalf("failed waiting for leader: %s", err.Error())
+	}
+
+	node2 := mustNewNode(false)
+	defer node2.Deprovision()
+	cfgStoreFn(node2)
+	if err := node2.Join(node1); err != nil {
+		t.Fatalf("node failed to join leader: %s", err.Error())
+	}
+	_, err = node2.WaitForLeader()
+	if err != nil {
+		t.Fatalf("failed waiting for leader: %s", err.Error())
+	}
+
+	// Get the new leader, in case it changed.
+	c := Cluster{node1, node2}
+	leader, err := c.Leader()
+	if err != nil {
+		t.Fatalf("failed to find cluster leader: %s", err.Error())
+	}
+
+	node3 := mustNewNode(false)
+	defer node3.Deprovision()
+	cfgStoreFn(node3)
+	if err := node3.Join(leader); err != nil {
+		t.Fatalf("node failed to join leader: %s", err.Error())
+	}
+	_, err = node3.WaitForLeader()
+	if err != nil {
+		t.Fatalf("failed waiting for leader: %s", err.Error())
+	}
+
+	// Get the new leader, in case it changed.
+	c = Cluster{node1, node2, node3}
+	leader, err = c.Leader()
+	if err != nil {
+		t.Fatalf("failed to find cluster leader: %s", err.Error())
+	}
+
+	// Confirm voting node is in the the cluster config.
+	nodes, err := leader.Nodes(true)
+	if err != nil {
+		t.Fatalf("failed to get nodes: %s", err.Error())
+	}
+	if !nodes.HasAddr(node3.RaftAddr) {
+		t.Fatalf("nodes do not contain non-voter node")
+	}
+
+	// Kill voting node, confirm it's not reaped.
+	node3.Deprovision()
+	tFn := func() bool {
+		nodes, _ = leader.Nodes(true)
+		return !nodes.HasAddr(node3.RaftAddr)
+	}
+
+	if trueOrTimeout(tFn, 10*time.Second) {
+		t.Fatalf("didn't time out waiting for node to be removed")
+	}
+}
+
+// Test_MultiNodeClusterNoReapReadOnlyZero tests that a node is not incorrectly reaped.
+func Test_MultiNodeClusterNoReapReadOnlyZero(t *testing.T) {
+	cfgStoreFn := func(n *Node) {
+		n.Store.ReapReadOnlyTimeout = 0
+	}
+
+	node1 := mustNewLeaderNode()
+	defer node1.Deprovision()
+	cfgStoreFn(node1)
+	_, err := node1.WaitForLeader()
+	if err != nil {
+		t.Fatalf("failed waiting for leader: %s", err.Error())
+	}
+
+	nonVoter := mustNewNode(false)
+	defer nonVoter.Deprovision()
+	cfgStoreFn(nonVoter)
+	if err := nonVoter.JoinAsNonVoter(node1); err != nil {
+		t.Fatalf("non-voting node failed to join leader: %s", err.Error())
+	}
+	_, err = nonVoter.WaitForLeader()
+	if err != nil {
+		t.Fatalf("failed waiting for leader: %s", err.Error())
+	}
+
+	// Confirm non-voter node is in the the cluster config.
+	nodes, err := node1.Nodes(true)
+	if err != nil {
+		t.Fatalf("failed to get nodes: %s", err.Error())
+	}
+	if !nodes.HasAddr(nonVoter.RaftAddr) {
+		t.Fatalf("nodes do not contain non-voter node")
+	}
+
+	// Kill non-voter node, confirm it's not removed.
+	nonVoter.Deprovision()
+	tFn := func() bool {
+		nodes, _ = node1.Nodes(true)
+		return !nodes.HasAddr(nonVoter.RaftAddr)
+	}
+	if trueOrTimeout(tFn, 10*time.Second) {
+		t.Fatalf("didn't time out waiting for node to be removed")
+	}
+}
+
+func mustGetExpvar(n *Node) string {
+	j, err := n.Expvar()
+	if err != nil {
+		panic(err.Error())
+	}
+	return j
+}
+
+func mustGetExpvarKey(n *Node, k string) string {
+	j, err := n.ExpvarKey(k)
+	if err != nil {
+		panic(err.Error())
+	}
+	return j
 }

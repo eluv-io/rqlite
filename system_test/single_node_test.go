@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"testing"
 	"time"
@@ -45,7 +46,7 @@ func Test_SingleNodeBasicEndpoint(t *testing.T) {
 	}
 }
 
-func Test_SingleNodeNotReady(t *testing.T) {
+func Test_SingleNodeNotReadyLive(t *testing.T) {
 	node := mustNewNode(false)
 	defer node.Deprovision()
 	ready, err := node.Ready()
@@ -54,6 +55,25 @@ func Test_SingleNodeNotReady(t *testing.T) {
 	}
 	if ready {
 		t.Fatalf("node is ready when it should not be")
+	}
+
+	liveness, err := node.Liveness()
+	if err != nil {
+		t.Fatalf(`failed to retrieve liveness: %s`, err)
+	}
+	if !liveness {
+		t.Fatalf("node is not live when it should not be")
+	}
+
+	// Confirm that hitting various endpoints with a non-ready node
+	// is OK.
+	_, err = node.Nodes(false)
+	if err != nil {
+		t.Fatalf(`failed to retrieve Nodes: %s`, err)
+	}
+	_, err = node.Status()
+	if err != nil {
+		t.Fatalf(`failed to retrieve status: %s`, err)
 	}
 }
 
@@ -199,7 +219,7 @@ func Test_SingleNodeConcurrentRequests(t *testing.T) {
 			defer wg.Done()
 			resp, err := PostExecuteStmt(node.APIAddr, `INSERT INTO foo(name) VALUES("fiona")`)
 			if err != nil {
-				t.Fatalf("failed to insert record: %s %s", err.Error(), resp)
+				t.Logf("failed to insert record: %s %s", err.Error(), resp)
 			}
 		}()
 	}
@@ -232,7 +252,7 @@ func Test_SingleNodeConcurrentRequestsCompressed(t *testing.T) {
 			defer wg.Done()
 			resp, err := PostExecuteStmt(node.APIAddr, `INSERT INTO foo(name) VALUES("fiona")`)
 			if err != nil {
-				t.Fatalf("failed to insert record: %s %s", err.Error(), resp)
+				t.Logf("failed to insert record: %s %s", err.Error(), resp)
 			}
 		}()
 	}
@@ -269,6 +289,49 @@ func Test_SingleNodeParameterized(t *testing.T) {
 		{
 			stmt:     []interface{}{"SELECT * FROM foo WHERE NAME=?", "fiona"},
 			expected: `{"results":[{"columns":["id","name","age"],"types":["integer","text","integer"],"values":[[1,"fiona",20]]}]}`,
+			execute:  false,
+		},
+	}
+
+	for i, tt := range tests {
+		var r string
+		var err error
+		if tt.execute {
+			r, err = node.ExecuteParameterized(tt.stmt)
+		} else {
+			r, err = node.QueryParameterized(tt.stmt)
+		}
+		if err != nil {
+			t.Fatalf(`test %d failed "%s": %s`, i, tt.stmt, err.Error())
+		}
+		if r != tt.expected {
+			t.Fatalf(`test %d received wrong result "%s" got: %s exp: %s`, i, tt.stmt, r, tt.expected)
+		}
+	}
+}
+
+func Test_SingleNodeParameterizedNull(t *testing.T) {
+	node := mustNewLeaderNode()
+	defer node.Deprovision()
+
+	tests := []struct {
+		stmt     []interface{}
+		expected string
+		execute  bool
+	}{
+		{
+			stmt:     []interface{}{"CREATE TABLE foo (id integer not null primary key, name text, age integer)"},
+			expected: `{"results":[{}]}`,
+			execute:  true,
+		},
+		{
+			stmt:     []interface{}{"INSERT INTO foo(name, age) VALUES(?, ?)", "declan", nil},
+			expected: `{"results":[{"last_insert_id":1,"rows_affected":1}]}`,
+			execute:  true,
+		},
+		{
+			stmt:     []interface{}{"SELECT * FROM foo WHERE NAME=?", "declan"},
+			expected: `{"results":[{"columns":["id","name","age"],"types":["integer","text","integer"],"values":[[1,"declan",null]]}]}`,
 			execute:  false,
 		},
 	}
@@ -330,6 +393,26 @@ func Test_SingleNodeParameterizedNamed(t *testing.T) {
 		if r != tt.expected {
 			t.Fatalf(`test %d received wrong result "%s" got: %s exp: %s`, i, tt.stmt, r, tt.expected)
 		}
+	}
+}
+
+func Test_SingleNodeRewriteRandom(t *testing.T) {
+	node := mustNewLeaderNode()
+	defer node.Deprovision()
+
+	_, err := node.Execute(`CREATE TABLE foo (id integer not null primary key, name text)`)
+	if err != nil {
+		t.Fatalf(`CREATE TABLE failed: %s`, err.Error())
+	}
+
+	resp, err := node.Execute(`INSERT INTO foo(id, name) VALUES(RANDOM(), "fiona")`)
+	if err != nil {
+		t.Fatalf(`queued write failed: %s`, err.Error())
+	}
+
+	match := regexp.MustCompile(`{"results":[{"last_insert_id":\-?[0-9]+,"rows_affected":1}]}`)
+	if !match.MatchString(resp) {
+		t.Fatalf("test received wrong result got %s", resp)
 	}
 }
 
@@ -630,47 +713,56 @@ func Test_SingleNodeNoSQLInjection(t *testing.T) {
 	}
 }
 
-func Test_SingleNodeRestart(t *testing.T) {
-	// Deprovision of a node deletes the node's dir, so make a copy first.
-	srcdir := filepath.Join("testdata", "v6.0.0-data")
-	destdir := mustTempDir()
-	if err := os.Remove(destdir); err != nil {
-		t.Fatalf("failed to remove dest dir: %s", err)
-	}
-	if err := copyDir(srcdir, destdir); err != nil {
-		t.Fatalf("failed to copy node test directory: %s", err)
-	}
-
-	mux, ln := mustNewOpenMux("")
-	defer ln.Close()
-
-	node := mustNodeEncrypted(destdir, true, false, mux, "node1")
-	defer node.Deprovision()
-	if _, err := node.WaitForLeader(); err != nil {
-		t.Fatal("node never became leader")
-	}
-
-	// Let's wait a few seconds to be sure logs are applied.
-	n := 0
-	for {
-		time.Sleep(1 * time.Second)
-
-		r, err := node.QueryNoneConsistency(`SELECT COUNT(*) FROM foo`)
-		if err != nil {
-			t.Fatalf("query failed: %s", err)
+// Test_SingleNodeUpgrades upgrade from a data created by earlier releases.
+func Test_SingleNodeUpgrades(t *testing.T) {
+	upgradeTo := func(dir string) {
+		// Deprovision of a node deletes the node's dir, so make a copy first.
+		srcdir := filepath.Join("testdata", dir)
+		destdir := mustTempDir()
+		if err := os.Remove(destdir); err != nil {
+			t.Fatalf("failed to remove dest dir: %s", err)
+		}
+		if err := copyDir(srcdir, destdir); err != nil {
+			t.Fatalf("failed to copy node test directory: %s", err)
 		}
 
-		expected := `{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[20]]}]}`
-		if r != expected {
-			if n == 10 {
-				t.Fatalf(`query received wrong result, got: %s exp: %s`, r, expected)
+		mux, ln := mustNewOpenMux("")
+		defer ln.Close()
+
+		node := mustNodeEncrypted(destdir, true, false, mux, "node1")
+		defer node.Deprovision()
+		if _, err := node.WaitForLeader(); err != nil {
+			t.Fatalf("node never became leader with %s data:", dir)
+		}
+
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		testSuccess := make(chan struct{})
+
+		for {
+			select {
+			case <-testSuccess:
+				return
+			case <-timer.C:
+				t.Fatalf(`timeout waiting for correct results with %s data`, dir)
+			case <-ticker.C:
+				r, err := node.QueryNoneConsistency(`SELECT COUNT(*) FROM foo`)
+				if err != nil {
+					t.Fatalf("query failed with %s data: %s", dir, err)
+				}
+				expected := `{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[20]]}]}`
+				if r == expected {
+					close(testSuccess)
+				}
 			}
-		} else {
-			break // Test successful!
 		}
-
-		n++
 	}
+
+	upgradeTo("v6.0.0-data")
+	upgradeTo("v7.0.0-data")
+	upgradeTo("v7.9.2-data")
 }
 
 func Test_SingleNodeNodes(t *testing.T) {

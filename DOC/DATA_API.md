@@ -1,4 +1,5 @@
 # Data API
+> :warning: **This page is no longer maintained. Visit [rqlite.io](https://www.rqlite.io) for the latest docs.**
 
 Each rqlite node exposes an HTTP API allowing data to be inserted into, and read back from, the database. Any changes to the database  (`INSERT`, `UPDATE`, `DELETE`) **must** be sent to the `/db/execute` endpoint, and reads (`SELECT`) should be sent to the `/db/query` endpoint. _It is important to use the correct endpoint for the operation you wish to perform._
 
@@ -45,7 +46,7 @@ Querying data is easy. For a single query simply perform an HTTP GET on the `/db
 curl -G 'localhost:4001/db/query?pretty&timings' --data-urlencode 'q=SELECT * FROM foo'
 ```
 
-The response is of the form:
+The **default** response is of the form:
 
 ```json
 {
@@ -82,6 +83,29 @@ curl -XPOST 'localhost:4001/db/query?pretty&timings' -H "Content-Type: applicati
 ]'
 ```
 The response will be in the same form as when the query is made via HTTP GET.
+
+### Associative response form
+A alternative form of response can be requested, by adding `associative` as a query parameter:
+```bash
+curl -G 'localhost:4001/db/query?pretty&timings&associative' --data-urlencode 'q=SELECT * FROM foo'
+```
+Response:
+```json
+{
+    "results": [
+        {
+            "types": {"id": "integer", "age": "integer", "name": "text"},
+            "rows": [
+                { "id": 1, "age": 20, "name": "fiona"},
+                { "id": 2, "age": 25, "name": "declan"}
+            ],
+            "time": 0.000173061
+        }
+    ],
+    "time": 0.000185964
+}
+```
+This form will have a map per row returned, with each column name as a key. This form can be more convenient for clients, depending on the application.
 
 ## Parameterized Statements
 While the "raw" API described above can be convenient and simple to use, it is vulnerable to [SQL Injection attacks](https://owasp.org/www-community/attacks/SQL_Injection). To protect against this issue, rqlite also supports [SQLite parameterized statements](https://www.sqlite.org/lang_expr.html#varparam), for both read and writes. To use this feature, send the SQL statement and values as distinct elements within a new JSON array, as follows:
@@ -149,19 +173,25 @@ curl -XPOST 'localhost:4001/db/execute?pretty&timings' -H "Content-Type: applica
 }
 ```
 
-## How rqlite handles requests
+## Queued Writes API
+Queued Writes can provide an order-of-magnitude speed up in write-performance. You can learn about the Queued Writes API [here](https://github.com/rqlite/rqlite/blob/master/DOC/QUEUED_WRITES.md).
+
+## Bulk API
+You can learn about the Bulk write API [here](https://github.com/rqlite/rqlite/blob/master/DOC/BULK.md).
+
+## How rqlite Handles Requests
 _This section assumes a basic familiarity with the Raft protocol. A simple introduction to Raft can be found [here](http://thesecretlivesofdata.com/raft/)._
 
-To make best use of the rqlite API, there are some important details to know.
+To make the very best use of the rqlite API, there are some important details to know. But understanding the following details is **not required** to make use of rqlite.
 
-With any rqlite cluster, all write-requests must be serviced by the cluster Leader -- this is due to the way the Raft consensus protocol works. If a client sends a write request to a Follower, the Follower transparently forwards the request to the Leader. The Follower waits for the response from the Leader, and returns it to the client.
+With any rqlite cluster, all write-requests must be serviced by the cluster Leader -- this is due to the way the Raft consensus protocol works. If a client sends a write request to a Follower (or read-only, non-voting, node), the Follower transparently forwards the request to the Leader. The Follower waits for the response from the Leader, and returns it to the client. Any credential information included in the original HTTP request to the Follower is included with the forwarded request (assuming that permission checking also passes first on the Follower), and permission checking is performed on the Leader.
 
 Queries, by default, are also serviced by the cluster Leader. Like write-requests, Followers will, by default, transparently forward queries to the Leader, and respond to the client after receiving the response from the Leader. However, depending on the [read-consistency](https://github.com/rqlite/rqlite/blob/master/DOC/CONSISTENCY.md) specified with the request, if a Follower received the query request it may serve that request directly and not contact the Leader. Which read-consistency level makes sense depends on your application.
 
 ### Data and the Raft log
 Any writes to the SQLite database go through the Raft log, ensuring only changes committed by a quorum of rqlite nodes are actually applied to the SQLite database. Queries do not __necessarily__ go through the Raft log, however, since they do not change the state of the database, and therefore do not need to be captured in the log. Only if _Strong_ read consistency is requested does a query go through the Raft log.
 
-## Request forwarding timeouts
+### Request Forwarding Timeouts
 If a Follower forwards a request to a Leader, by default the Leader must respond within 30 seconds. You can control this timeout by setting the `timeout` parameter. For example, to set a 2 minute timeout, you would issue the following request:
 ```bash
 curl -XPOST 'localhost:4001/db/execute?timeout=2m' -H "Content-Type: application/json" -d '[
@@ -169,12 +199,12 @@ curl -XPOST 'localhost:4001/db/execute?timeout=2m' -H "Content-Type: application
 ]'
 ```
 
-## Disabling Request Forwarding
+### Disabling Request Forwarding
 If you do not wish a Follower to transparently forward a request to a Leader, add `redirect` to the URL as a query parameter. In that case if a Follower receives a request that can only be serviced by the Leader, the Follower will respond with [HTTP 301 Moved Permanently](https://en.wikipedia.org/wiki/HTTP_301) and include the address of the Leader as the `Location` header in the response. It is then up the clients to re-issue the command to the Leader.
 
 This option was made available as it provides maximum visibility to the clients, should they prefer if. For example, if a Follower transparently forwarded a request to the Leader, and one of the nodes then crashed during processing, it may be difficult for the client to determine where in the chain of nodes the processing failed.
 
-## Example of redirect on query
+### Example of redirect on query
 ```
 $ curl -v -G 'localhost:4003/db/query?pretty&timings&redirect' --data-urlencode 'q=SELECT * FROM foo'
 *   Trying ::1...
@@ -197,11 +227,5 @@ $ curl -v -G 'localhost:4003/db/query?pretty&timings&redirect' --data-urlencode 
 
 * Connection #0 to host localhost left intact
 ```
-
-## Queued Writes API
-You can learn about the Queued Writes API [here](https://github.com/rqlite/rqlite/blob/master/DOC/QUEUED_WRITES.md).
-
-## Bulk API
-You can learn about the Bulk API [here](https://github.com/rqlite/rqlite/blob/master/DOC/BULK.md).
 
 

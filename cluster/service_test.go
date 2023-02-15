@@ -2,6 +2,8 @@ package cluster
 
 import (
 	"crypto/tls"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"testing"
@@ -13,7 +15,7 @@ import (
 
 func Test_NewServiceOpenClose(t *testing.T) {
 	ml := mustNewMockTransport()
-	s := New(ml, mustNewMockDatabase())
+	s := New(ml, mustNewMockDatabase(), mustNewMockManager(), mustNewMockCredentialStore())
 	if s == nil {
 		t.Fatalf("failed to create cluster service")
 	}
@@ -31,7 +33,7 @@ func Test_NewServiceOpenClose(t *testing.T) {
 
 func Test_NewServiceSetGetAPIAddr(t *testing.T) {
 	ml := mustNewMockTransport()
-	s := New(ml, mustNewMockDatabase())
+	s := New(ml, mustNewMockDatabase(), mustNewMockManager(), mustNewMockCredentialStore())
 	if s == nil {
 		t.Fatalf("failed to create cluster service")
 	}
@@ -52,7 +54,7 @@ func Test_NewServiceSetGetAPIAddr(t *testing.T) {
 
 func Test_NewServiceSetGetNodeAPIAddr(t *testing.T) {
 	ml := mustNewMockTransport()
-	s := New(ml, mustNewMockDatabase())
+	s := New(ml, mustNewMockDatabase(), mustNewMockManager(), mustNewMockCredentialStore())
 	if s == nil {
 		t.Fatalf("failed to create cluster service")
 	}
@@ -97,7 +99,7 @@ func Test_NewServiceSetGetNodeAPIAddr(t *testing.T) {
 
 func Test_NewServiceSetGetNodeAPIAddrLocal(t *testing.T) {
 	ml := mustNewMockTransport()
-	s := New(ml, mustNewMockDatabase())
+	s := New(ml, mustNewMockDatabase(), mustNewMockManager(), mustNewMockCredentialStore())
 	if s == nil {
 		t.Fatalf("failed to create cluster service")
 	}
@@ -134,7 +136,7 @@ func Test_NewServiceSetGetNodeAPIAddrLocal(t *testing.T) {
 
 func Test_NewServiceSetGetNodeAPIAddrTLS(t *testing.T) {
 	ml := mustNewMockTLSTransport()
-	s := New(ml, mustNewMockDatabase())
+	s := New(ml, mustNewMockDatabase(), mustNewMockManager(), mustNewMockCredentialStore())
 	if s == nil {
 		t.Fatalf("failed to create cluster service")
 	}
@@ -167,6 +169,92 @@ func Test_NewServiceSetGetNodeAPIAddrTLS(t *testing.T) {
 
 	if err := s.Close(); err != nil {
 		t.Fatalf("failed to close cluster service")
+	}
+}
+
+func Test_NewServiceTestExecuteQueryAuthNoCredentials(t *testing.T) {
+	ml := mustNewMockTransport()
+	db := mustNewMockDatabase()
+	clstr := mustNewMockManager()
+
+	// Test that for a cluster with no credential store configed
+	// all users are authed for both operations
+	var c CredentialStore = nil
+	c = nil
+	s := New(ml, db, clstr, c)
+	if s == nil {
+		t.Fatalf("failed to create cluster service")
+	}
+
+	if err := s.Open(); err != nil {
+		t.Fatalf("failed to open cluster service")
+	}
+
+	cl := NewClient(ml, 30*time.Second)
+	if err := cl.SetLocal(s.Addr(), s); err != nil {
+		t.Fatalf("failed to set cluster client local parameters: %s", err)
+	}
+	er := &command.ExecuteRequest{}
+	_, err := cl.Execute(er, s.Addr(), nil, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qr := &command.QueryRequest{}
+	_, err = cl.Query(qr, s.Addr(), nil, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Test_NewServiceTestExecuteQueryAuth tests that for a cluster with a credential
+// store, configured users with execute permissions can execute and users with
+// query permissions can query, and can't if they don't have those permissions.
+func Test_NewServiceTestExecuteQueryAuth(t *testing.T) {
+	ml := mustNewMockTransport()
+	db := mustNewMockDatabase()
+	clstr := mustNewMockManager()
+
+	f := func(username string, password string, perm string) bool {
+		if username == "alice" && password == "secret1" && perm == "execute" {
+			return true
+		} else if username == "bob" && password == "secret1" && perm == "query" {
+			return true
+		}
+		return false
+	}
+	c := &mockCredentialStore{aaFunc: f}
+
+	s := New(ml, db, clstr, c)
+	if s == nil {
+		t.Fatalf("failed to create cluster service")
+	}
+
+	if err := s.Open(); err != nil {
+		t.Fatalf("failed to open cluster service")
+	}
+
+	cl := NewClient(ml, 30*time.Second)
+	if err := cl.SetLocal(s.Addr(), s); err != nil {
+		t.Fatalf("failed to set cluster client local parameters: %s", err)
+	}
+	er := &command.ExecuteRequest{}
+	_, err := cl.Execute(er, s.Addr(), makeCredentials("alice", "secret1"), 5*time.Second)
+	if err != nil {
+		t.Fatal("alice improperly unauthorized to execute")
+	}
+	_, err = cl.Execute(er, s.Addr(), makeCredentials("bob", "secret1"), 5*time.Second)
+	if err == nil {
+		t.Fatal("bob improperly authorized to execute")
+	}
+	qr := &command.QueryRequest{}
+	_, err = cl.Query(qr, s.Addr(), makeCredentials("bob", "secret1"), 5*time.Second)
+	if err != nil && err.Error() != "unauthorized" {
+		fmt.Println(err)
+		t.Fatal("bob improperly unauthorized to query")
+	}
+	_, err = cl.Query(qr, s.Addr(), makeCredentials("alice", "secret1"), 5*time.Second)
+	if err != nil && err.Error() != "unauthorized" {
+		t.Fatal("alice improperly authorized to query")
 	}
 }
 
@@ -225,6 +313,8 @@ func mustNewMockTLSTransport() *mockTransport {
 type mockDatabase struct {
 	executeFn func(er *command.ExecuteRequest) ([]*command.ExecuteResult, error)
 	queryFn   func(qr *command.QueryRequest) ([]*command.QueryRows, error)
+	backupFn  func(br *command.BackupRequest, dst io.Writer) error
+	loadFn    func(lr *command.LoadRequest) error
 }
 
 func (m *mockDatabase) Execute(er *command.ExecuteRequest) ([]*command.ExecuteResult, error) {
@@ -235,8 +325,43 @@ func (m *mockDatabase) Query(qr *command.QueryRequest) ([]*command.QueryRows, er
 	return m.queryFn(qr)
 }
 
+func (m *mockDatabase) Backup(br *command.BackupRequest, dst io.Writer) error {
+	if m.backupFn == nil {
+		return nil
+	}
+	return m.backupFn(br, dst)
+}
+
+func (m *mockDatabase) Load(lr *command.LoadRequest) error {
+	if m.loadFn == nil {
+		return nil
+	}
+	return m.loadFn(lr)
+}
+
 func mustNewMockDatabase() *mockDatabase {
-	return &mockDatabase{}
+	e := func(er *command.ExecuteRequest) ([]*command.ExecuteResult, error) {
+		return []*command.ExecuteResult{}, nil
+	}
+	q := func(er *command.QueryRequest) ([]*command.QueryRows, error) {
+		return []*command.QueryRows{}, nil
+	}
+	return &mockDatabase{executeFn: e, queryFn: q}
+}
+
+type MockManager struct {
+	removeNodeFn func(rn *command.RemoveNodeRequest) error
+}
+
+func (m *MockManager) Remove(rn *command.RemoveNodeRequest) error {
+	if m.removeNodeFn == nil {
+		return nil
+	}
+	return m.removeNodeFn(rn)
+}
+
+func mustNewMockManager() *MockManager {
+	return &MockManager{}
 }
 
 func mustCreateTLSConfig() *tls.Config {
@@ -257,4 +382,31 @@ func mustCreateTLSConfig() *tls.Config {
 	}
 
 	return config
+}
+
+type mockCredentialStore struct {
+	HasPermOK bool
+	aaFunc    func(username, password, perm string) bool
+}
+
+func (m *mockCredentialStore) AA(username, password, perm string) bool {
+	if m == nil {
+		return true
+	}
+
+	if m.aaFunc != nil {
+		return m.aaFunc(username, password, perm)
+	}
+	return m.HasPermOK
+}
+
+func mustNewMockCredentialStore() *mockCredentialStore {
+	return &mockCredentialStore{HasPermOK: true}
+}
+
+func makeCredentials(username, password string) *Credentials {
+	return &Credentials{
+		Username: username,
+		Password: password,
+	}
 }
