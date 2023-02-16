@@ -1,8 +1,10 @@
 package http
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/rqlite/rqlite/v7/command"
 )
@@ -47,7 +49,9 @@ func ParseRequest(b []byte) ([]*command.Statement, error) {
 	}
 
 	// Next try parameterized form.
-	if err := json.Unmarshal(b, &parameterized); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	if err := dec.Decode(&parameterized); err != nil {
 		return nil, ErrInvalidJSON
 	}
 	stmts := make([]*command.Statement, len(parameterized))
@@ -94,6 +98,19 @@ func ParseRequest(b []byte) ([]*command.Statement, error) {
 }
 
 func makeParameter(name string, i interface{}) (*command.Parameter, error) {
+	if num, ok := i.(json.Number); ok {
+		i64, err := num.Int64()
+		if err == nil {
+			i = i64
+		} else {
+			f64, err := num.Float64()
+			if err != nil {
+				return nil, errors.New(fmt.Sprintf("invalid number %s", num.String()))
+			}
+			i = f64
+		}
+	}
+
 	switch v := i.(type) {
 	case int:
 	case int64:
