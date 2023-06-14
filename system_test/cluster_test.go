@@ -3,6 +3,7 @@ package system
 import (
 	"fmt"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/rqlite/rqlite/v7/db"
 	"github.com/rqlite/rqlite/v7/http"
 	"github.com/rqlite/rqlite/v7/queue"
+	"github.com/rqlite/rqlite/v7/rtls"
 	"github.com/rqlite/rqlite/v7/store"
 	"github.com/rqlite/rqlite/v7/tcp"
 )
@@ -120,7 +122,7 @@ func Test_MultiNodeCluster(t *testing.T) {
 
 	// Kill the leader and wait for the new leader.
 	leader.Deprovision()
-	c.RemoveNode(leader)
+	c = c.RemoveNode(leader)
 	leader, err = c.WaitForNewLeader(leader)
 	if err != nil {
 		t.Fatalf("failed to find new cluster leader after killing leader: %s", err.Error())
@@ -344,7 +346,7 @@ func Test_MultiNodeClusterBootstrap(t *testing.T) {
 
 	// Kill the leader and wait for the new leader.
 	leader.Deprovision()
-	c.RemoveNode(leader)
+	c = c.RemoveNode(leader)
 	leader, err = c.WaitForNewLeader(leader)
 	if err != nil {
 		t.Fatalf("failed to find new cluster leader after killing leader: %s", err.Error())
@@ -503,13 +505,18 @@ func Test_MultiNodeClusterBootstrapLaterJoinHTTPS(t *testing.T) {
 	node3.Store.BootstrapExpect = 3
 	defer node3.Deprovision()
 
+	tlsConfig, err := rtls.CreateClientConfig("", "", "", true, false)
+	if err != nil {
+		t.Fatalf("failed to create TLS config: %s", err)
+	}
+
 	provider := cluster.NewAddressProviderString(
 		[]string{node1.APIAddr, node2.APIAddr, node3.APIAddr})
-	node1Bs := cluster.NewBootstrapper(provider, nil)
+	node1Bs := cluster.NewBootstrapper(provider, tlsConfig)
 	node1Bs.Interval = time.Second
-	node2Bs := cluster.NewBootstrapper(provider, nil)
+	node2Bs := cluster.NewBootstrapper(provider, tlsConfig)
 	node2Bs.Interval = time.Second
-	node3Bs := cluster.NewBootstrapper(provider, nil)
+	node3Bs := cluster.NewBootstrapper(provider, tlsConfig)
 	node3Bs.Interval = time.Second
 
 	// Have all nodes start a bootstrap basically in parallel,
@@ -568,7 +575,7 @@ func Test_MultiNodeClusterBootstrapLaterJoinHTTPS(t *testing.T) {
 	node4 := mustNewNodeEncrypted(false, true, true)
 	node4.Store.BootstrapExpect = 3
 	defer node3.Deprovision()
-	node4Bs := cluster.NewBootstrapper(provider, nil)
+	node4Bs := cluster.NewBootstrapper(provider, tlsConfig)
 	node4Bs.Interval = time.Second
 	done := func() bool {
 		addr, _ := node4.Store.LeaderAddr()
@@ -836,6 +843,12 @@ func Test_MultiNodeClusterQueuedWrites(t *testing.T) {
 // Test_MultiNodeClusterLargeQueuedWrites tests writing to a cluster using
 // many large concurrent Queued Writes operations.
 func Test_MultiNodeClusterLargeQueuedWrites(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// https://github.com/rqlite/rqlite/issues/1123
+		// This is not great, but extensive testing on Windows has not been
+		// successful yet, so skip this test for now.
+		t.Skip("skipping test on windows")
+	}
 	store.ResetStats()
 	db.ResetStats()
 	http.ResetStats()
@@ -921,18 +934,31 @@ func Test_MultiNodeClusterNodesNonVoter(t *testing.T) {
 		t.Fatalf("failed to find cluster leader: %s", err.Error())
 	}
 
-	node3 := mustNewNode(false)
-	defer node3.Deprovision()
-	if err := node3.JoinAsNonVoter(leader); err != nil {
+	nonVoter := mustNewNode(false)
+	defer nonVoter.Deprovision()
+	if err := nonVoter.JoinAsNonVoter(leader); err != nil {
 		t.Fatalf("node failed to join leader: %s", err.Error())
 	}
-	_, err = node3.WaitForLeader()
+	_, err = nonVoter.WaitForLeader()
 	if err != nil {
 		t.Fatalf("failed waiting for leader: %s", err.Error())
 	}
 
+	// Check that the voter statuses are correct
+	checkVoterStatus := func(node *Node, exp bool) {
+		v, err := node.IsVoter()
+		if err != nil {
+			t.Fatalf("failed to get voter status: %s", err.Error())
+		}
+		if v != exp {
+			t.Fatalf("incorrect voter status, got %v, exp %v", v, exp)
+		}
+	}
+	checkVoterStatus(leader, true)
+	checkVoterStatus(nonVoter, false)
+
 	// Get the new leader, in case it changed.
-	c = Cluster{node1, node2, node3}
+	c = Cluster{node1, node2, nonVoter}
 	_, err = c.Leader()
 	if err != nil {
 		t.Fatalf("failed to find cluster leader: %s", err.Error())
@@ -1058,7 +1084,7 @@ func Test_MultiNodeClusterNodeEncrypted(t *testing.T) {
 
 	// Kill the leader and wait for the new leader.
 	leader.Deprovision()
-	c.RemoveNode(leader)
+	c = c.RemoveNode(leader)
 	leader, err = c.WaitForNewLeader(leader)
 	if err != nil {
 		t.Fatalf("failed to find new cluster leader after killing leader: %s", err.Error())
@@ -1177,7 +1203,7 @@ func Test_MultiNodeClusterSnapshot(t *testing.T) {
 
 	// Kill original node.
 	node1.Deprovision()
-	c.RemoveNode(node1)
+	c = c.RemoveNode(node1)
 	var leader *Node
 	leader, err = c.WaitForNewLeader(node1)
 	if err != nil {
@@ -1299,7 +1325,7 @@ func Test_MultiNodeClusterWithNonVoter(t *testing.T) {
 
 	// Kill the leader and wait for the new leader.
 	leader.Deprovision()
-	c.RemoveNode(leader)
+	c = c.RemoveNode(leader)
 	leader, err = c.WaitForNewLeader(leader)
 	if err != nil {
 		t.Fatalf("failed to find new cluster leader after killing leader: %s", err.Error())
@@ -1574,7 +1600,6 @@ func Test_MultiNodeClusterReapNodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed waiting for leader: %s", err.Error())
 	}
-	c = Cluster{node1, node2, node3, nonVoter}
 
 	// Confirm non-voter node is in the the cluster config.
 	nodes, err := leader.Nodes(true)
@@ -1776,20 +1801,4 @@ func Test_MultiNodeClusterNoReapReadOnlyZero(t *testing.T) {
 	if trueOrTimeout(tFn, 10*time.Second) {
 		t.Fatalf("didn't time out waiting for node to be removed")
 	}
-}
-
-func mustGetExpvar(n *Node) string {
-	j, err := n.Expvar()
-	if err != nil {
-		panic(err.Error())
-	}
-	return j
-}
-
-func mustGetExpvarKey(n *Node, k string) string {
-	j, err := n.ExpvarKey(k)
-	if err != nil {
-		panic(err.Error())
-	}
-	return j
 }

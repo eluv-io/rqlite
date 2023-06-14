@@ -35,9 +35,51 @@ type Rows struct {
 // AssociativeRows represents the outcome of an operation that returns query data.
 type AssociativeRows struct {
 	Types map[string]string        `json:"types,omitempty"`
-	Rows  []map[string]interface{} `json:"rows,omitempty"`
+	Rows  []map[string]interface{} `json:"rows"`
 	Error string                   `json:"error,omitempty"`
 	Time  float64                  `json:"time,omitempty"`
+}
+
+// ResultWithRows represents the outcome of an operation that changes rows, but also
+// includes an nil rows object, so clients can distinguish between a query and execute
+// result.
+type ResultWithRows struct {
+	Result
+	Rows []map[string]interface{} `json:"rows"`
+}
+
+// NewResultRowsFromExecuteQueryResponse returns an API object from an
+// ExecuteQueryResponse.
+func NewResultRowsFromExecuteQueryResponse(e *command.ExecuteQueryResponse) (interface{}, error) {
+	if er := e.GetE(); er != nil {
+		return NewResultFromExecuteResult(er)
+	} else if qr := e.GetQ(); qr != nil {
+		return NewRowsFromQueryRows(qr)
+	} else if err := e.GetError(); err != "" {
+		return map[string]string{
+			"error": err,
+		}, nil
+	}
+	return nil, errors.New("no ExecuteResult, QueryRows, or Error")
+}
+
+func NewAssociativeResultRowsFromExecuteQueryResponse(e *command.ExecuteQueryResponse) (interface{}, error) {
+	if er := e.GetE(); er != nil {
+		r, err := NewResultFromExecuteResult(er)
+		if err != nil {
+			return nil, err
+		}
+		return &ResultWithRows{
+			Result: *r,
+		}, nil
+	} else if qr := e.GetQ(); qr != nil {
+		return NewAssociativeRowsFromQueryRows(qr)
+	} else if err := e.GetError(); err != "" {
+		return map[string]string{
+			"error": err,
+		}, nil
+	}
+	return nil, errors.New("no ExecuteResult, QueryRows, or Error")
 }
 
 // NewResultFromExecuteResult returns an API Result object from an ExecuteResult.
@@ -142,7 +184,8 @@ func NewValuesFromQueryValues(dest [][]interface{}, v []*command.Values) error {
 	return nil
 }
 
-// Encoder is used to JSON marshal ExecuteResults and QueryRows
+// Encoder is used to JSON marshal ExecuteResults, QueryRows
+// and ExecuteQueryRequests.
 type Encoder struct {
 	Associative bool
 }
@@ -176,7 +219,9 @@ func noEscapeEncode(i interface{}) ([]byte, error) {
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
-func jsonMarshal(i interface{}, f func(i interface{}) ([]byte, error), assoc bool) ([]byte, error) {
+type marshalFunc func(i interface{}) ([]byte, error)
+
+func jsonMarshal(i interface{}, f marshalFunc, assoc bool) ([]byte, error) {
 	switch v := i.(type) {
 	case *command.ExecuteResult:
 		r, err := NewResultFromExecuteResult(v)
@@ -208,6 +253,12 @@ func jsonMarshal(i interface{}, f func(i interface{}) ([]byte, error), assoc boo
 			}
 			return f(r)
 		}
+	case *command.ExecuteQueryResponse:
+		r, err := NewResultRowsFromExecuteQueryResponse(v)
+		if err != nil {
+			return nil, err
+		}
+		return f(r)
 	case []*command.QueryRows:
 		var err error
 
@@ -229,6 +280,28 @@ func jsonMarshal(i interface{}, f func(i interface{}) ([]byte, error), assoc boo
 				}
 			}
 			return f(rows)
+		}
+	case []*command.ExecuteQueryResponse:
+		if assoc {
+			res := make([]interface{}, len(v))
+			for j := range v {
+				r, err := NewAssociativeResultRowsFromExecuteQueryResponse(v[j])
+				if err != nil {
+					return nil, err
+				}
+				res[j] = r
+			}
+			return f(res)
+		} else {
+			res := make([]interface{}, len(v))
+			for j := range v {
+				r, err := NewResultRowsFromExecuteQueryResponse(v[j])
+				if err != nil {
+					return nil, err
+				}
+				res[j] = r
+			}
+			return f(res)
 		}
 	case []*command.Values:
 		values := make([][]interface{}, len(v))

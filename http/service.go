@@ -5,13 +5,11 @@ package http
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"expvar"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -26,7 +24,9 @@ import (
 	"github.com/rqlite/rqlite/v7/cluster"
 	"github.com/rqlite/rqlite/v7/command"
 	"github.com/rqlite/rqlite/v7/command/encoding"
+	"github.com/rqlite/rqlite/v7/db"
 	"github.com/rqlite/rqlite/v7/queue"
+	"github.com/rqlite/rqlite/v7/rtls"
 	"github.com/rqlite/rqlite/v7/store"
 )
 
@@ -54,6 +54,10 @@ type Database interface {
 	// is held on the database.
 	Query(qr *command.QueryRequest) ([]*command.QueryRows, error)
 
+	// Request processes a slice of requests, each of which can be either
+	// an Execute or Query request.
+	Request(eqr *command.ExecuteQueryRequest) ([]*command.ExecuteQueryResponse, error)
+
 	// Load loads a SQLite file into the system
 	Load(lr *command.LoadRequest) error
 }
@@ -63,16 +67,19 @@ type Store interface {
 	Database
 
 	// Join joins the node with the given ID, reachable at addr, to this node.
-	Join(id, addr string, voter bool) error
+	Join(jr *command.JoinRequest) error
 
 	// Notify notifies this node that a node is available at addr.
-	Notify(id, addr string) error
+	Notify(nr *command.NotifyRequest) error
 
 	// RemoveNode removes the node from the cluster.
 	Remove(rn *command.RemoveNodeRequest) error
 
 	// LeaderAddr returns the Raft address of the leader of the cluster.
 	LeaderAddr() (string, error)
+
+	// Ready returns whether the Store is ready to service requests.
+	Ready() bool
 
 	// Stats returns stats on the Store.
 	Stats() (map[string]interface{}, error)
@@ -94,6 +101,9 @@ type Cluster interface {
 
 	// Query performs an Query Request on a remote node.
 	Query(qr *command.QueryRequest, nodeAddr string, creds *cluster.Credentials, timeout time.Duration) ([]*command.QueryRows, error)
+
+	// Request performs an ExecuteQuery Request on a remote node.
+	Request(eqr *command.ExecuteQueryRequest, nodeAddr string, creds *cluster.Credentials, timeout time.Duration) ([]*command.ExecuteQueryResponse, error)
 
 	// Backup retrieves a backup from a remote node and writes to the io.Writer.
 	Backup(br *command.BackupRequest, nodeAddr string, creds *cluster.Credentials, timeout time.Duration, w io.Writer) error
@@ -119,10 +129,12 @@ type StatusReporter interface {
 	Stats() (map[string]interface{}, error)
 }
 
-// DBResults stores either an Execute result or a Query result
+// DBResults stores either an Execute result, a Query result, or
+// an ExecuteQuery result.
 type DBResults struct {
-	ExecuteResult []*command.ExecuteResult
-	QueryRows     []*command.QueryRows
+	ExecuteResult        []*command.ExecuteResult
+	QueryRows            []*command.QueryRows
+	ExecuteQueryResponse []*command.ExecuteQueryResponse
 
 	AssociativeJSON bool // Render in associative form
 }
@@ -142,6 +154,8 @@ func (d *DBResults) MarshalJSON() ([]byte, error) {
 		return enc.JSONMarshal(d.ExecuteResult)
 	} else if d.QueryRows != nil {
 		return enc.JSONMarshal(d.QueryRows)
+	} else if d.ExecuteQueryResponse != nil {
+		return enc.JSONMarshal(d.ExecuteQueryResponse)
 	}
 	return json.Marshal(make([]interface{}, 0))
 }
@@ -177,6 +191,7 @@ var stats *expvar.Map
 const (
 	numLeaderNotFound                 = "leader_not_found"
 	numExecutions                     = "executions"
+	numExecuteStmtsRx                 = "execute_stmts_rx"
 	numQueuedExecutions               = "queued_executions"
 	numQueuedExecutionsOK             = "queued_executions_ok"
 	numQueuedExecutionsStmtsRx        = "queued_executions_num_stmts_rx"
@@ -188,8 +203,15 @@ const (
 	numQueuedExecutionsFailed         = "queued_executions_failed"
 	numQueuedExecutionsWait           = "queued_executions_wait"
 	numQueries                        = "queries"
+	numQueryStmtsRx                   = "query_stmts_rx"
+	numRequests                       = "requests"
+	numRequestStmtsRx                 = "request_stmts_rx"
 	numRemoteExecutions               = "remote_executions"
+	numRemoteExecutionsFailed         = "remote_executions_failed"
 	numRemoteQueries                  = "remote_queries"
+	numRemoteQueriesFailed            = "remote_queries_failed"
+	numRemoteRequests                 = "remote_requests"
+	numRemoteRequestsFailed           = "remote_requests_failed"
 	numRemoteBackups                  = "remote_backups"
 	numRemoteLoads                    = "remote_loads"
 	numRemoteRemoveNode               = "remote_remove_node"
@@ -224,6 +246,7 @@ func ResetStats() {
 	stats.Init()
 	stats.Add(numLeaderNotFound, 0)
 	stats.Add(numExecutions, 0)
+	stats.Add(numExecuteStmtsRx, 0)
 	stats.Add(numQueuedExecutions, 0)
 	stats.Add(numQueuedExecutionsOK, 0)
 	stats.Add(numQueuedExecutionsStmtsRx, 0)
@@ -235,8 +258,15 @@ func ResetStats() {
 	stats.Add(numQueuedExecutionsFailed, 0)
 	stats.Add(numQueuedExecutionsWait, 0)
 	stats.Add(numQueries, 0)
+	stats.Add(numQueryStmtsRx, 0)
+	stats.Add(numRequests, 0)
+	stats.Add(numRequestStmtsRx, 0)
 	stats.Add(numRemoteExecutions, 0)
+	stats.Add(numRemoteExecutionsFailed, 0)
 	stats.Add(numRemoteQueries, 0)
+	stats.Add(numRemoteQueriesFailed, 0)
+	stats.Add(numRemoteRequests, 0)
+	stats.Add(numRemoteRequestsFailed, 0)
 	stats.Add(numRemoteBackups, 0)
 	stats.Add(numRemoteLoads, 0)
 	stats.Add(numRemoteRemoveNode, 0)
@@ -270,10 +300,12 @@ type Service struct {
 	statusMu sync.RWMutex
 	statuses map[string]StatusReporter
 
-	CACertFile string // Path to root X.509 certificate.
-	CertFile   string // Path to SSL certificate.
-	KeyFile    string // Path to SSL private key.
-	TLS1011    bool   // Whether older, deprecated TLS should be supported.
+	CACertFile   string // Path to x509 CA certificate used to verify certificates.
+	CertFile     string // Path to server's own x509 certificate.
+	KeyFile      string // Path to server's own x509 private key.
+	TLS1011      bool   // Whether older, deprecated TLS should be supported.
+	ClientVerify bool   // Whether client certificates should verified.
+	tlsConfig    *tls.Config
 
 	DefaultQueueCap     int
 	DefaultQueueBatchSz int
@@ -328,15 +360,26 @@ func (s *Service) Start() error {
 			return err
 		}
 	} else {
-		config, err := createTLSConfig(s.CertFile, s.KeyFile, s.CACertFile, s.TLS1011)
+		s.tlsConfig, err = rtls.CreateServerConfig(s.CertFile, s.KeyFile, s.CACertFile, !s.ClientVerify, s.TLS1011)
 		if err != nil {
 			return err
 		}
-		ln, err = tls.Listen("tcp", s.addr, config)
+		ln, err = tls.Listen("tcp", s.addr, s.tlsConfig)
 		if err != nil {
 			return err
 		}
-		s.logger.Printf("secure HTTPS server enabled with cert %s, key %s", s.CertFile, s.KeyFile)
+		var b strings.Builder
+		b.WriteString(fmt.Sprintf("secure HTTPS server enabled with cert %s, key %s", s.CertFile, s.KeyFile))
+		if s.CACertFile != "" {
+			b.WriteString(fmt.Sprintf(", CA cert %s", s.CACertFile))
+		}
+		if s.ClientVerify {
+			b.WriteString(", mutual TLS enabled")
+		} else {
+			b.WriteString(", mutual disabled")
+		}
+		// print the message
+		s.logger.Println(b.String())
 	}
 	s.ln = ln
 
@@ -372,7 +415,6 @@ func (s *Service) Close() {
 	<-s.queueDone
 
 	s.ln.Close()
-	return
 }
 
 // HTTPS returns whether this service is using HTTPS.
@@ -393,6 +435,9 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/db/query"):
 		stats.Add(numQueries, 1)
 		s.handleQuery(w, r)
+	case strings.HasPrefix(r.URL.Path, "/db/request"):
+		stats.Add(numRequests, 1)
+		s.handleRequest(w, r)
 	case strings.HasPrefix(r.URL.Path, "/db/backup"):
 		stats.Add(numBackups, 1)
 		s.handleBackup(w, r)
@@ -449,7 +494,7 @@ func (s *Service) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b, err := ioutil.ReadAll(r.Body)
+	b, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -497,7 +542,12 @@ func (s *Service) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.store.Join(remoteID, remoteAddr, voter.(bool)); err != nil {
+	jr := &command.JoinRequest{
+		Id:      remoteID,
+		Address: remoteAddr,
+		Voter:   voter.(bool),
+	}
+	if err := s.store.Join(jr); err != nil {
 		if err == store.ErrNotLeader {
 			leaderAPIAddr := s.LeaderAPIAddr()
 			if leaderAPIAddr == "" {
@@ -528,7 +578,7 @@ func (s *Service) handleNotify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b, err := ioutil.ReadAll(r.Body)
+	b, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -565,7 +615,10 @@ func (s *Service) handleNotify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.store.Notify(remoteID, remoteAddr); err != nil {
+	if err := s.store.Notify(&command.NotifyRequest{
+		Id:      remoteID,
+		Address: remoteAddr,
+	}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -588,7 +641,7 @@ func (s *Service) handleRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b, err := ioutil.ReadAll(r.Body)
+	b, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -797,18 +850,26 @@ func (s *Service) handleLoad(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b, err := ioutil.ReadAll(r.Body)
+	b, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	r.Body.Close()
 
-	if validSQLiteFile(b) {
+	if db.IsValidSQLiteData(b) {
 		s.logger.Printf("SQLite database file detected as load data")
 		lr := &command.LoadRequest{
 			Data: b,
 		}
+
+		if db.IsWALModeEnabled(b) {
+			s.logger.Printf("SQLite database file is in WAL mode - rejecting load request")
+			http.Error(w, `SQLite database file is in WAL mode - convert it to DELETE mode via 'PRAGMA journal_mode=DELETE'`,
+				http.StatusBadRequest)
+			return
+		}
+
 		err := s.store.Load(lr)
 		if err != nil && err != store.ErrNotLeader {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -954,6 +1015,7 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"auth":      prettyEnabled(s.credentialStore != nil),
 		"cluster":   clusterStatus,
 		"queue":     queueStats,
+		"tls":       s.tlsStats(),
 	}
 
 	nodeStatus := map[string]interface{}{
@@ -1160,8 +1222,15 @@ func (s *Service) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(fmt.Sprintf("[+]node ok\n[+]leader not contactable: %s", err.Error())))
 		return
 	}
+
+	if !s.store.Ready() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("[+]node ok\n[+]leader ok\n[+]store not ready"))
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("[+]node ok\n[+]leader ok"))
+	w.Write([]byte("[+]node ok\n[+]leader ok\n[+]store ok"))
 }
 
 func (s *Service) handleExecute(w http.ResponseWriter, r *http.Request) {
@@ -1217,7 +1286,7 @@ func (s *Service) queuedExecute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b, err := ioutil.ReadAll(r.Body)
+	b, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1250,7 +1319,7 @@ func (s *Service) queuedExecute(w http.ResponseWriter, r *http.Request) {
 	var fc queue.FlushChannel
 	if wait {
 		stats.Add(numQueuedExecutionsWait, 1)
-		fc = make(queue.FlushChannel, 0)
+		fc = make(queue.FlushChannel)
 	}
 
 	seqNum, err := s.stmtQueue.Write(stmts, fc)
@@ -1273,7 +1342,6 @@ func (s *Service) queuedExecute(w http.ResponseWriter, r *http.Request) {
 
 	resp.end = time.Now()
 	s.writeResponse(w, r, resp)
-	return
 }
 
 // execute handles queries that modify the database.
@@ -1286,7 +1354,7 @@ func (s *Service) execute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b, err := ioutil.ReadAll(r.Body)
+	b, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1298,6 +1366,7 @@ func (s *Service) execute(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	stats.Add(numExecuteStmtsRx, int64(len(stmts)))
 	if err := command.Rewrite(stmts, !noRewriteRandom); err != nil {
 		http.Error(w, fmt.Sprintf("SQL rewrite: %s", err.Error()), http.StatusInternalServerError)
 		return
@@ -1344,9 +1413,12 @@ func (s *Service) execute(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Add(ServedByHTTPHeader, addr)
 		results, resultsErr = s.cluster.Execute(er, addr, makeCredentials(username, password), timeout)
-		if resultsErr != nil && resultsErr.Error() == "unauthorized" {
-			http.Error(w, "remote execute not authorized", http.StatusUnauthorized)
-			return
+		if resultsErr != nil {
+			stats.Add(numRemoteExecutionsFailed, 1)
+			if resultsErr.Error() == "unauthorized" {
+				http.Error(w, "remote execute not authorized", http.StatusUnauthorized)
+				return
+			}
 		}
 		stats.Add(numRemoteExecutions, 1)
 	}
@@ -1374,25 +1446,7 @@ func (s *Service) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	timeout, isTx, timings, redirect, noRewriteRandom, err := reqParams(r, defaultTimeout)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	lvl, err := level(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	frsh, err := freshness(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	assoc, err := isAssociative(r)
+	timeout, frsh, lvl, isTx, timings, redirect, noRewriteRandom, isAssoc, err := queryReqParams(r, defaultTimeout)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1404,6 +1458,7 @@ func (s *Service) handleQuery(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	stats.Add(numQueryStmtsRx, int64(len(queries)))
 
 	// No point rewriting queries if they don't go through the Raft log, since they
 	// will never be replayed from the log anyway.
@@ -1415,7 +1470,7 @@ func (s *Service) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := NewResponse()
-	resp.Results.AssociativeJSON = assoc
+	resp.Results.AssociativeJSON = isAssoc
 
 	qr := &command.QueryRequest{
 		Request: &command.Request{
@@ -1458,9 +1513,12 @@ func (s *Service) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Add(ServedByHTTPHeader, addr)
 		results, resultsErr = s.cluster.Query(qr, addr, makeCredentials(username, password), timeout)
-		if resultsErr != nil && resultsErr.Error() == "unauthorized" {
-			http.Error(w, "remote query not authorized", http.StatusUnauthorized)
-			return
+		if resultsErr != nil {
+			stats.Add(numRemoteQueriesFailed, 1)
+			if resultsErr.Error() == "unauthorized" {
+				http.Error(w, "remote query not authorized", http.StatusUnauthorized)
+				return
+			}
 		}
 		stats.Add(numRemoteQueries, 1)
 	}
@@ -1469,6 +1527,107 @@ func (s *Service) handleQuery(w http.ResponseWriter, r *http.Request) {
 		resp.Error = resultsErr.Error()
 	} else {
 		resp.Results.QueryRows = results
+	}
+	resp.end = time.Now()
+	s.writeResponse(w, r, resp)
+}
+
+func (s *Service) handleRequest(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	if !s.CheckRequestPermAll(r, auth.PermQuery, auth.PermExecute) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	if r.Method != "POST" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	timeout, frsh, lvl, isTx, timings, redirect, noRewriteRandom, isAssoc, err := executeQueryReqParams(r, defaultTimeout)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	b, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	r.Body.Close()
+
+	stmts, err := ParseRequest(b)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	stats.Add(numRequestStmtsRx, int64(len(stmts)))
+
+	if err := command.Rewrite(stmts, noRewriteRandom); err != nil {
+		http.Error(w, fmt.Sprintf("SQL rewrite: %s", err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	resp := NewResponse()
+	resp.Results.AssociativeJSON = isAssoc
+
+	eqr := &command.ExecuteQueryRequest{
+		Request: &command.Request{
+			Transaction: isTx,
+			Statements:  stmts,
+		},
+		Timings:   timings,
+		Level:     lvl,
+		Freshness: frsh.Nanoseconds(),
+	}
+
+	results, resultErr := s.store.Request(eqr)
+	if resultErr != nil && resultErr == store.ErrNotLeader {
+		if redirect {
+			leaderAPIAddr := s.LeaderAPIAddr()
+			if leaderAPIAddr == "" {
+				stats.Add(numLeaderNotFound, 1)
+				http.Error(w, ErrLeaderNotFound.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			loc := s.FormRedirect(r, leaderAPIAddr)
+			http.Redirect(w, r, loc, http.StatusMovedPermanently)
+			return
+		}
+
+		addr, err := s.store.LeaderAddr()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if addr == "" {
+			stats.Add(numLeaderNotFound, 1)
+			http.Error(w, ErrLeaderNotFound.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		username, password, ok := r.BasicAuth()
+		if !ok {
+			username = ""
+		}
+
+		w.Header().Add(ServedByHTTPHeader, addr)
+		results, resultErr = s.cluster.Request(eqr, addr, makeCredentials(username, password), timeout)
+		if resultErr != nil {
+			stats.Add(numRemoteRequestsFailed, 1)
+			if resultErr.Error() == "unauthorized" {
+				http.Error(w, "remote request not authorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		stats.Add(numRemoteRequests, 1)
+	}
+
+	if resultErr != nil {
+		resp.Error = resultErr.Error()
+	} else {
+		resp.Results.ExecuteQueryResponse = results
 	}
 	resp.end = time.Now()
 	s.writeResponse(w, r, resp)
@@ -1553,6 +1712,35 @@ func (s *Service) CheckRequestPerm(r *http.Request, perm string) (b bool) {
 	}
 
 	return s.credentialStore.AA(username, password, perm)
+}
+
+// CheckRequestPermAll checksif the request is authenticated and authorized
+// with all the given Perms.
+func (s *Service) CheckRequestPermAll(r *http.Request, perms ...string) (b bool) {
+	defer func() {
+		if b {
+			stats.Add(numAuthOK, 1)
+		} else {
+			stats.Add(numAuthFail, 1)
+		}
+	}()
+
+	// No auth store set, so no checking required.
+	if s.credentialStore == nil {
+		return true
+	}
+
+	username, password, ok := r.BasicAuth()
+	if !ok {
+		username = ""
+	}
+
+	for _, perm := range perms {
+		if !s.credentialStore.AA(username, password, perm) {
+			return false
+		}
+	}
+	return true
 }
 
 // LeaderAPIAddr returns the API address of the leader, as known by this node.
@@ -1692,6 +1880,21 @@ func (s *Service) addBuildVersion(w http.ResponseWriter) {
 	w.Header().Add(VersionHTTPHeader, version)
 }
 
+// tlsStats returns the TLS stats for the service.
+func (s *Service) tlsStats() map[string]interface{} {
+	m := map[string]interface{}{
+		"enabled": prettyEnabled(s.tlsConfig != nil),
+	}
+	if s.tlsConfig != nil {
+		m["client_auth"] = s.tlsConfig.ClientAuth.String()
+		m["cert_file"] = s.CertFile
+		m["key_file"] = s.KeyFile
+		m["ca_file"] = s.CACertFile
+		m["next_protos"] = s.tlsConfig.NextProtos
+	}
+	return m
+}
+
 // writeResponse writes the given response to the given writer.
 func (s *Service) writeResponse(w http.ResponseWriter, r *http.Request, j Responser) {
 	var b []byte
@@ -1732,45 +1935,13 @@ func requestQueries(r *http.Request) ([]*command.Statement, error) {
 		}, nil
 	}
 
-	b, err := ioutil.ReadAll(r.Body)
+	b, err := io.ReadAll(r.Body)
 	if err != nil {
 		return nil, errors.New("bad query POST request")
 	}
 	r.Body.Close()
 
 	return ParseRequest(b)
-}
-
-// createTLSConfig returns a TLS config from the given cert and key.
-func createTLSConfig(certFile, keyFile, caCertFile string, tls1011 bool) (*tls.Config, error) {
-	var err error
-
-	var minTLS = uint16(tls.VersionTLS12)
-	if tls1011 {
-		minTLS = tls.VersionTLS10
-	}
-
-	config := &tls.Config{
-		NextProtos: []string{"h2", "http/1.1"},
-		MinVersion: minTLS,
-	}
-	config.Certificates = make([]tls.Certificate, 1)
-	config.Certificates[0], err = tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, err
-	}
-	if caCertFile != "" {
-		asn1Data, err := ioutil.ReadFile(caCertFile)
-		if err != nil {
-			return nil, err
-		}
-		config.RootCAs = x509.NewCertPool()
-		ok := config.RootCAs.AppendCertsFromPEM(asn1Data)
-		if !ok {
-			return nil, fmt.Errorf("failed to parse root certificate(s) in %q", caCertFile)
-		}
-	}
-	return config, nil
 }
 
 // queryParam returns whether the given query param is present.
@@ -1863,6 +2034,39 @@ func reqParams(req *http.Request, def time.Duration) (timeout time.Duration, tx,
 		return 0, false, false, false, true, err
 	}
 	return timeout, tx, timings, redirect, noRwRandom, nil
+}
+
+// queryReqParams is a convenience function to get a bunch of query params
+// in one function call.
+func queryReqParams(req *http.Request, def time.Duration) (timeout, frsh time.Duration, lvl command.QueryRequest_Level, isTx, timings, redirect, noRwRandom, isAssoc bool, err error) {
+	timeout, isTx, timings, redirect, noRwRandom, err = reqParams(req, defaultTimeout)
+	if err != nil {
+		return 0, 0, command.QueryRequest_QUERY_REQUEST_LEVEL_WEAK, false, false, false, false, false, err
+	}
+
+	lvl, err = level(req)
+	if err != nil {
+		return 0, 0, command.QueryRequest_QUERY_REQUEST_LEVEL_WEAK, false, false, false, false, false, err
+	}
+
+	frsh, err = freshness(req)
+	if err != nil {
+		return 0, 0, command.QueryRequest_QUERY_REQUEST_LEVEL_WEAK, false, false, false, false, false, err
+	}
+
+	isAssoc, err = isAssociative(req)
+	if err != nil {
+		return 0, 0, command.QueryRequest_QUERY_REQUEST_LEVEL_WEAK, false, false, false, false, false, err
+	}
+	return
+}
+
+func executeQueryReqParams(req *http.Request, def time.Duration) (timeout, frsh time.Duration, lvl command.QueryRequest_Level, isTx, timings, redirect, noRwRandom, isAssoc bool, err error) {
+	timeout, frsh, lvl, isTx, timings, redirect, noRwRandom, isAssoc, err = queryReqParams(req, defaultTimeout)
+	if err != nil {
+		return 0, 0, command.QueryRequest_QUERY_REQUEST_LEVEL_WEAK, false, false, false, false, false, err
+	}
+	return timeout, frsh, lvl, isTx, timings, redirect, noRwRandom, isAssoc, nil
 }
 
 // noLeader returns whether processing should skip the leader check.
@@ -1964,30 +2168,6 @@ func executeRequestFromStrings(s []string, timings, tx bool) *command.ExecuteReq
 		},
 		Timings: timings,
 	}
-}
-
-// queryRequestFromStrings converts a slice of strings into a command.QueryRequest
-func queryRequestFromStrings(s []string, timings, tx bool) *command.QueryRequest {
-	stmts := make([]*command.Statement, len(s))
-	for i := range s {
-		stmts[i] = &command.Statement{
-			Sql: s[i],
-		}
-
-	}
-	return &command.QueryRequest{
-		Request: &command.Request{
-			Statements:  stmts,
-			Transaction: tx,
-		},
-		Timings: timings,
-	}
-}
-
-// validateSQLiteFile checks that the supplied data looks like a SQLite database
-// file. See https://www.sqlite.org/fileformat.html
-func validSQLiteFile(b []byte) bool {
-	return len(b) > 13 && string(b[0:13]) == "SQLite format"
 }
 
 func resolvableAddress(addr string) (string, error) {

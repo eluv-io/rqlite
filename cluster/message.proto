@@ -23,6 +23,9 @@ message Command {
         COMMAND_TYPE_BACKUP = 4;
         COMMAND_TYPE_LOAD = 5;
         COMMAND_TYPE_REMOVE_NODE = 6;
+        COMMAND_TYPE_NOTIFY = 7;
+        COMMAND_TYPE_JOIN = 8;
+        COMMAND_TYPE_REQUEST = 9;
     }
     Type type = 1;
 
@@ -32,6 +35,9 @@ message Command {
         command.BackupRequest backup_request = 5;
         command.LoadRequest load_request = 6;
         command.RemoveNodeRequest remove_node_request = 7;
+        command.NotifyRequest notify_request = 8;
+        command.JoinRequest join_request = 9;
+        command.ExecuteQueryRequest execute_query_request = 10;
     }
 
     Credentials credentials = 4;
@@ -47,6 +53,11 @@ message CommandQueryResponse {
 	repeated command.QueryRows rows = 2;
 }
 
+message CommandRequestResponse {
+    string error = 1;
+    repeated command.ExecuteQueryResponse response = 2;
+}
+
 message CommandBackupResponse {
     string error = 1;
     bytes data = 2;
@@ -57,5 +68,13 @@ message CommandLoadResponse {
 }
 
 message CommandRemoveNodeResponse {
+    string error = 1;
+}
+
+message CommandNotifyResponse {
+    string error = 1;
+}
+
+message CommandJoinResponse {
     string error = 1;
 }

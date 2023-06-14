@@ -2,7 +2,6 @@ package embedded_test
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -18,6 +17,8 @@ func TestStandalone(t *testing.T) {
 
 	var cleanup func()
 	cfg := embedded.DefaultConfig()
+	cfg.NodeX509Cert = ""
+	cfg.NodeX509Key = ""
 	cfg.HTTPAddr = fmt.Sprintf("127.0.0.1:%d", freePort())
 	cfg.RaftAddr = fmt.Sprintf("127.0.0.1:%d", freePort())
 	cfg.DataPath, cleanup = makeTestDir("rqlite")
@@ -39,7 +40,7 @@ func TestStandalone(t *testing.T) {
 }
 
 func makeTestDir(prefix string) (path string, cleanup func()) {
-	path, err := ioutil.TempDir(os.TempDir(), prefix)
+	path, err := os.MkdirTemp(os.TempDir(), prefix)
 	if err != nil {
 		log.Fatalf("failed to create test dir %s: %s", path, err)
 	}

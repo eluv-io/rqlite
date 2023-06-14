@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/rqlite/rqlite/v7/cluster"
@@ -156,6 +157,32 @@ func (n *Node) QueryParameterized(stmt []interface{}) (string, error) {
 	return n.postQuery(string(j))
 }
 
+// Request runs a single request against the node.
+func (n *Node) Request(stmt string) (string, error) {
+	return n.RequestMulti([]string{stmt})
+}
+
+// RequestMulti runs multiple statements in a single request against the node.
+func (n *Node) RequestMulti(stmts []string) (string, error) {
+	j, err := json.Marshal(stmts)
+	if err != nil {
+		return "", err
+	}
+	return n.postRequest(string(j))
+}
+
+// RequestMultiParameterized runs a single paramterized request against the node
+func (n *Node) RequestMultiParameterized(stmt []interface{}) (string, error) {
+	m := make([][]interface{}, 1)
+	m[0] = stmt
+
+	j, err := json.Marshal(m)
+	if err != nil {
+		return "", err
+	}
+	return n.postRequest(string(j))
+}
+
 // Noop inserts a noop command into the Store's Raft log.
 func (n *Node) Noop(id string) error {
 	return n.Store.Noop(id)
@@ -235,7 +262,7 @@ func (n *Node) Nodes(includeNonVoters bool) (NodesStatus, error) {
 		return nil, fmt.Errorf("nodes endpoint returned: %s", resp.Status)
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -255,15 +282,44 @@ func (n *Node) Status() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("status endpoint returned: %s", resp.Status)
-	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to read status response: %w", err)
+	}
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("status endpoint returned: %s (%s)", resp.Status,
+			strings.TrimSuffix(string(body), "\n"))
 	}
 	return string(body), nil
+}
+
+// IsVoter returns whether the node is a voter or not.
+func (n *Node) IsVoter() (bool, error) {
+	statusJSON, err := n.Status()
+	if err != nil {
+		return false, err
+	}
+	// Marshal the status into a JSON object
+	var status map[string]interface{}
+	err = json.Unmarshal([]byte(statusJSON), &status)
+	if err != nil {
+		return false, err
+	}
+
+	strStatus, ok := status["store"].(map[string]interface{})
+	if !ok {
+		return false, fmt.Errorf("store status not found")
+	}
+	raftStatus, ok := strStatus["raft"].(map[string]interface{})
+	if !ok {
+		return false, fmt.Errorf("raft status not found")
+	}
+	voter, ok := raftStatus["voter"].(bool)
+	if !ok {
+		return false, fmt.Errorf("voter status not found")
+	}
+	return voter, nil
 }
 
 // Ready returns the ready status for the node
@@ -306,7 +362,7 @@ func (n *Node) ExpvarKey(k string) (string, error) {
 		return "", fmt.Errorf("expvar endpoint returned: %s", resp.Status)
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
@@ -339,7 +395,7 @@ func (n *Node) postExecute(stmt string) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
@@ -357,7 +413,7 @@ func (n *Node) postExecuteQueued(stmt string, wait bool) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
@@ -376,7 +432,7 @@ func (n *Node) query(stmt, consistency string) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
@@ -389,7 +445,20 @@ func (n *Node) postQuery(stmt string) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}
+
+func (n *Node) postRequest(stmt string) (string, error) {
+	resp, err := http.Post("http://"+n.APIAddr+"/db/request", "application/json", strings.NewReader(stmt))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
@@ -413,7 +482,7 @@ func PostExecuteStmtMulti(apiAddr string, stmts []string) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
@@ -477,13 +546,14 @@ func (c Cluster) Followers() ([]*Node, error) {
 
 // RemoveNode removes the given node from the list of nodes representing
 // a cluster.
-func (c Cluster) RemoveNode(node *Node) {
-	for i, n := range c {
-		if n.RaftAddr == node.RaftAddr {
-			c = append(c[:i], c[i+1:]...)
-			return
+func (c Cluster) RemoveNode(node *Node) Cluster {
+	nodes := []*Node{}
+	for _, n := range c {
+		if n.RaftAddr != node.RaftAddr {
+			nodes = append(nodes, n)
 		}
 	}
+	return nodes
 }
 
 // FindNodeByRaftAddr returns the node with the given Raft address.
@@ -624,7 +694,7 @@ func mustNodeEncryptedOnDisk(dir string, enableSingle, httpEncrypt bool, mux *tc
 	}
 	node.Cluster = clstr
 
-	clstrDialer := tcp.NewDialer(cluster.MuxClusterHeader, false, true)
+	clstrDialer := tcp.NewDialer(cluster.MuxClusterHeader, nil)
 	clstrClient := cluster.NewClient(clstrDialer, 30*time.Second)
 	node.Service = httpd.New("localhost:0", node.Store, clstrClient, nil)
 	node.Service.Expvar = true
@@ -656,11 +726,20 @@ func mustNewLeaderNode() *Node {
 
 func mustTempDir() string {
 	var err error
-	path, err := ioutil.TempDir("", "rqlilte-system-test-")
+	path, err := os.MkdirTemp("", "rqlilte-system-test-")
 	if err != nil {
 		panic("failed to create temp dir")
 	}
 	return path
+}
+
+func mustTempFile() string {
+	f, err := os.CreateTemp("", "rqlite-system-test-")
+	if err != nil {
+		panic("failed to create temp file")
+	}
+	f.Close()
+	return f.Name()
 }
 
 func mustNewOpenMux(addr string) (*tcp.Mux, net.Listener) {
@@ -694,11 +773,10 @@ func mustNewOpenTLSMux(certFile, keyPath, addr string) *tcp.Mux {
 	}
 
 	var mux *tcp.Mux
-	mux, err = tcp.NewTLSMux(ln, nil, certFile, keyPath, "")
+	mux, err = tcp.NewTLSMux(ln, nil, certFile, keyPath, "", true, false)
 	if err != nil {
 		panic(fmt.Sprintf("failed to create node-to-node mux: %s", err.Error()))
 	}
-	mux.InsecureSkipVerify = true
 
 	go mux.Serve()
 	return mux
@@ -770,7 +848,7 @@ func mustCreateTLSConfig(certFile, keyFile, caCertFile string) *tls.Config {
 	}
 
 	if caCertFile != "" {
-		asn1Data, err := ioutil.ReadFile(caCertFile)
+		asn1Data, err := os.ReadFile(caCertFile)
 		if err != nil {
 			panic(err.Error())
 		}
@@ -879,7 +957,7 @@ func copyDir(src string, dst string) (err error) {
 		return
 	}
 
-	entries, err := ioutil.ReadDir(src)
+	entries, err := os.ReadDir(src)
 	if err != nil {
 		return
 	}
@@ -895,7 +973,7 @@ func copyDir(src string, dst string) (err error) {
 			}
 		} else {
 			// Skip symlinks.
-			if entry.Mode()&os.ModeSymlink != 0 {
+			if entry.Type()&fs.ModeSymlink != 0 {
 				continue
 			}
 
@@ -945,6 +1023,28 @@ func trueOrTimeout(fn func() bool, dur time.Duration) bool {
 			if fn() {
 				return true
 			}
+		}
+	}
+}
+
+func testPoll(t *testing.T, f func() (bool, error), p time.Duration, timeout time.Duration) {
+	tck := time.NewTicker(p)
+	defer tck.Stop()
+	tmr := time.NewTimer(timeout)
+	defer tmr.Stop()
+
+	for {
+		select {
+		case <-tck.C:
+			b, err := f()
+			if err != nil {
+				continue
+			}
+			if b {
+				return
+			}
+		case <-tmr.C:
+			t.Fatalf("timeout expired: %s", t.Name())
 		}
 	}
 }

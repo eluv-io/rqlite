@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -79,30 +81,49 @@ type Config struct {
 	TLS1011 bool
 
 	// AuthFile is the path to the authentication file. May not be set.
-	AuthFile string
+	AuthFile string `filepath:"true"`
 
-	// X509CACert is the path the root-CA certficate file for when this
-	// node contacts other nodes' HTTP servers. May not be set.
-	X509CACert string
+	// AutoBackupFile is the path to the auto-backup file. May not be set.
+	AutoBackupFile string `filepath:"true"`
 
-	// X509Cert is the path to the X509 cert for the HTTP server. May not be set.
-	X509Cert string
+	// AutoRestoreFile is the path to the auto-restore file. May not be set.
+	AutoRestoreFile string `filepath:"true"`
 
-	// X509Key is the path to the private key for the HTTP server. May not be set.
-	X509Key string
+	// HTTPx509CACert is the path to the CA certficate file for when this node verifies
+	// other certificates for any HTTP communications. May not be set.
+	HTTPx509CACert string `filepath:"true"`
+
+	// HTTPx509Cert is the path to the X509 cert for the HTTP server. May not be set.
+	HTTPx509Cert string `filepath:"true"`
+
+	// HTTPx509Key is the path to the private key for the HTTP server. May not be set.
+	HTTPx509Key string `filepath:"true"`
+
+	// NoHTTPVerify disables checking other nodes' server HTTP X509 certs for validity.
+	NoHTTPVerify bool
+
+	// HTTPVerifyClient indicates whether the HTTP server should verify client certificates.
+	HTTPVerifyClient bool
 
 	// NodeEncrypt indicates whether node encryption should be enabled.
 	NodeEncrypt bool
 
-	// NodeX509CACert is the path the root-CA certficate file for when this
-	// node contacts other nodes' Raft servers. May not be set.
-	NodeX509CACert string
+	// NodeX509CACert is the path to the CA certficate file for when this node verifies
+	// other certificates for any inter-node communications. May not be set.
+	NodeX509CACert string `filepath:"true"`
 
 	// NodeX509Cert is the path to the X509 cert for the Raft server. May not be set.
-	NodeX509Cert string
+	NodeX509Cert string `filepath:"true"`
 
 	// NodeX509Key is the path to the X509 key for the Raft server. May not be set.
-	NodeX509Key string
+	NodeX509Key string `filepath:"true"`
+
+	// NoNodeVerify disables checking other nodes' Node X509 certs for validity.
+	NoNodeVerify bool
+
+	// NodeVerifyClient indicates whether a node should verify client certificates from
+	// other nodes.
+	NodeVerifyClient bool
 
 	// NodeID is the Raft ID for the node.
 	NodeID string
@@ -144,12 +165,6 @@ type Config struct {
 
 	// BootstrapRetryMaxInterval is the maximum retry interval - see BootstrapRetryInterval.
 	BootstrapRetryMaxInterval time.Duration
-
-	// NoHTTPVerify disables checking other nodes' HTTP X509 certs for validity.
-	NoHTTPVerify bool
-
-	// NoNodeVerify disables checking other nodes' Node X509 certs for validity.
-	NoNodeVerify bool
 
 	// DisoMode sets the discovery mode. May not be set.
 	DiscoMode string
@@ -204,6 +219,9 @@ type Config struct {
 
 	// RaftShutdownOnRemove sets whether Raft should be shutdown if the node is removed
 	RaftShutdownOnRemove bool
+
+	// RaftClusterRemoveOnShutdown sets whether the node should remove itself from the cluster on shutdown
+	RaftClusterRemoveOnShutdown bool
 
 	// RaftStepdownOnShutdown sets whether Leadership should be relinquished on shutdown
 	RaftStepdownOnShutdown bool
@@ -260,6 +278,28 @@ func (c *Config) Validate() error {
 		return errors.New("-on-disk-path is set, but -on-disk is not")
 	}
 
+	dataPath, err := filepath.Abs(c.DataPath)
+	if err != nil {
+		return fmt.Errorf("failed to determine absolute data path: %s", err.Error())
+	}
+	c.DataPath = dataPath
+
+	err = c.CheckFilePaths()
+	if err != nil {
+		return err
+	}
+
+	if !bothUnsetSet(c.HTTPx509Cert, c.HTTPx509Key) {
+		return fmt.Errorf("either both -%s and -%s must be set, or neither", "HTTPx509Cert", "HTTPx509Key")
+	}
+	if !bothUnsetSet(c.NodeX509Cert, c.NodeX509Key) {
+		return fmt.Errorf("either both -%s and -%s must be set, or neither", "NodeX509Cert", "NodeX509Key")
+	}
+
+	if c.RaftAddr == c.HTTPAddr {
+		return errors.New("HTTP and Raft addresses must differ")
+	}
+
 	// Enforce policies regarding addresses
 	if c.RaftAdv == "" {
 		c.RaftAdv = c.RaftAddr
@@ -304,12 +344,16 @@ func (c *Config) Validate() error {
 			radv, RaftAddrFlag, RaftAdvAddrFlag)
 	}
 
+	if c.RaftAdv == c.HTTPAdv {
+		return errors.New("advertised HTTP and Raft addresses must differ")
+	}
+
 	// Enforce bootstrapping policies
 	if c.BootstrapExpect > 0 && c.RaftNonVoter {
 		return errors.New("bootstrapping only applicable to voting nodes")
 	}
 
-	// Join addresses OK?
+	// Join parameters OK?
 	if c.JoinAddr != "" {
 		addrs := strings.Split(c.JoinAddr, ",")
 		for i := range addrs {
@@ -321,8 +365,14 @@ func (c *Config) Validate() error {
 				if u.Host == c.HTTPAdv || addrs[i] == c.HTTPAddr {
 					return errors.New("node cannot join with itself unless bootstrapping")
 				}
+				if c.AutoRestoreFile != "" {
+					return errors.New("auto-restoring cannot be used when joining a cluster")
+				}
 			}
 		}
+	}
+	if c.JoinSrcIP != "" && net.ParseIP(c.JoinSrcIP) == nil {
+		return fmt.Errorf("invalid join source IP address: %s", c.JoinSrcIP)
 	}
 
 	// Valid disco mode?
@@ -357,7 +407,7 @@ func (c *Config) JoinAddresses() []string {
 // protocol, host and port.
 func (c *Config) HTTPURL() string {
 	apiProto := "http"
-	if c.X509Cert != "" {
+	if c.HTTPx509Cert != "" {
 		apiProto = "https"
 	}
 	return fmt.Sprintf("%s://%s", apiProto, c.HTTPAdv)
@@ -382,10 +432,43 @@ func (c *Config) DiscoConfigReader() io.ReadCloser {
 	return rc
 }
 
+// CheckFilePaths checks that all file paths in the config exist.
+// Empy filepaths are ignored.
+func (c *Config) CheckFilePaths() error {
+	v := reflect.ValueOf(c).Elem()
+
+	// Iterate through the fields of the struct
+	for i := 0; i < v.NumField(); i++ {
+		field := v.Type().Field(i)
+		fieldValue := v.Field(i)
+
+		if fieldValue.Kind() != reflect.String {
+			continue
+		}
+
+		if tagValue, ok := field.Tag.Lookup("filepath"); ok && tagValue == "true" {
+			filePath := fieldValue.String()
+			if filePath == "" {
+				continue
+			}
+			_, err := os.Stat(filePath)
+			if os.IsNotExist(err) {
+				return fmt.Errorf("%s does not exist", filePath)
+			}
+		}
+	}
+	return nil
+}
+
 // BuildInfo is build information for display at command line.
 type BuildInfo struct {
 	Version       string
 	Commit        string
 	Branch        string
 	SQLiteVersion string
+}
+
+// bothUnsetSet returns true if both a and b are unset, or both are set.
+func bothUnsetSet(a, b string) bool {
+	return (a == "" && b == "") || (a != "" && b != "")
 }

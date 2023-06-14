@@ -5,6 +5,7 @@ package auth
 import (
 	"encoding/json"
 	"io"
+	"os"
 	"sync"
 
 	"golang.org/x/crypto/bcrypt"
@@ -45,13 +46,13 @@ type BasicAuther interface {
 // HashCache store hash values for users. Safe for use from multiple goroutines.
 type HashCache struct {
 	mu sync.RWMutex
-	m  map[string]map[string]bool
+	m  map[string]map[string]struct{}
 }
 
 // NewHashCache returns a instantiated HashCache
 func NewHashCache() *HashCache {
 	return &HashCache{
-		m: make(map[string]map[string]bool),
+		m: make(map[string]map[string]struct{}),
 	}
 }
 
@@ -74,9 +75,9 @@ func (h *HashCache) Store(username, hash string) {
 	defer h.mu.Unlock()
 	_, ok := h.m[username]
 	if !ok {
-		h.m[username] = make(map[string]bool)
+		h.m[username] = make(map[string]struct{})
 	}
-	h.m[username][hash] = true
+	h.m[username][hash] = struct{}{}
 }
 
 // Credential represents authentication and authorization configuration for a single user.
@@ -103,6 +104,18 @@ func NewCredentialsStore() *CredentialsStore {
 		hashCache: NewHashCache(),
 		UseCache:  true,
 	}
+}
+
+// NewCredentialsStoreFromFile returns a new instance of a CredentialStore loaded from a file.
+func NewCredentialsStoreFromFile(path string) (*CredentialsStore, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	c := NewCredentialsStore()
+	return c, c.Load(f)
 }
 
 // Load loads credential information from a reader.

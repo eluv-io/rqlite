@@ -2,16 +2,13 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -23,11 +20,15 @@ import (
 	"github.com/rqlite/rqlite-disco-clients/etcd"
 
 	"github.com/rqlite/rqlite/v7/auth"
+	"github.com/rqlite/rqlite/v7/auto/backup"
+	"github.com/rqlite/rqlite/v7/auto/restore"
+	"github.com/rqlite/rqlite/v7/aws"
 	"github.com/rqlite/rqlite/v7/cluster"
 	"github.com/rqlite/rqlite/v7/cmd"
 	"github.com/rqlite/rqlite/v7/db"
 	"github.com/rqlite/rqlite/v7/disco"
 	httpd "github.com/rqlite/rqlite/v7/http"
+	"github.com/rqlite/rqlite/v7/rtls"
 	"github.com/rqlite/rqlite/v7/store"
 	"github.com/rqlite/rqlite/v7/tcp"
 )
@@ -46,7 +47,9 @@ const logo = `
 
 const name = `rqlited`
 const desc = `rqlite is a lightweight, distributed relational database, which uses SQLite as its
-storage engine. It provides an easy-to-use, fault-tolerant store for relational data.`
+storage engine. It provides an easy-to-use, fault-tolerant store for relational data.
+
+Visit https://www.rqlite.io to learn more.`
 
 func init() {
 	log.SetFlags(log.LstdFlags)
@@ -64,9 +67,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to parse command-line flags: %s", err.Error())
 	}
+	fmt.Print(logo)
 
-	// Display logo.
-	fmt.Printf(logo)
+	mainCtx, mainCancel := context.WithCancel(context.Background())
+	defer mainCancel()
 
 	// Configure logging and pump out initial message.
 	log.Printf("%s starting, version %s, SQLite %s, commit %s, branch %s, compiler %s", name, cmd.Version,
@@ -96,6 +100,30 @@ func main() {
 		log.Fatalf("failed to create store: %s", err.Error())
 	}
 
+	// Install the auto-restore file, if necessary.
+	if cfg.AutoRestoreFile != "" {
+		log.Printf("auto-restore requested, initiating download")
+
+		start := time.Now()
+		path, errOK, err := downloadRestoreFile(mainCtx, cfg.AutoRestoreFile)
+		if err != nil {
+			var b strings.Builder
+			b.WriteString(fmt.Sprintf("failed to download auto-restore file: %s", err.Error()))
+			if errOK {
+				b.WriteString(", continuing with node startup anyway")
+				log.Print(b.String())
+			} else {
+				log.Fatal(b.String())
+			}
+		} else {
+			log.Printf("auto-restore file downloaded in %s", time.Since(start))
+
+			if err := str.SetRestorePath(path); err != nil {
+				log.Fatalf("failed to preload auto-restore data: %s", err.Error())
+			}
+		}
+	}
+
 	// Get any credential store.
 	credStr, err := credentialStore(cfg)
 	if err != nil {
@@ -103,19 +131,20 @@ func main() {
 	}
 
 	// Create cluster service now, so nodes will be able to learn information about each other.
-	clstr, err := clusterService(cfg, mux.Listen(cluster.MuxClusterHeader), str, str, credStr)
+	clstrServ, err := clusterService(cfg, mux.Listen(cluster.MuxClusterHeader), str, str, credStr)
 	if err != nil {
 		log.Fatalf("failed to create cluster service: %s", err.Error())
 	}
 	log.Printf("cluster TCP mux Listener registered with byte header %d", cluster.MuxClusterHeader)
 
+	// Create the HTTP service.
+	//
 	// We want to start the HTTP server as soon as possible, so the node is responsive and external
 	// systems can see that it's running. We still have to open the Store though, so the node won't
 	// be able to do much until that happens however.
-	clstrDialer := tcp.NewDialer(cluster.MuxClusterHeader, cfg.NodeEncrypt, cfg.NoNodeVerify)
-	clstrClient := cluster.NewClient(clstrDialer, cfg.ClusterConnectTimeout)
-	if err := clstrClient.SetLocal(cfg.RaftAdv, clstr); err != nil {
-		log.Fatalf("failed to set cluster client local parameters: %s", err.Error())
+	clstrClient, err := createClusterClient(cfg, clstrServ)
+	if err != nil {
+		log.Fatalf("failed to create cluster client: %s", err.Error())
 	}
 	httpServ, err := startHTTPService(cfg, str, clstrClient, credStr)
 	if err != nil {
@@ -129,19 +158,13 @@ func main() {
 	}
 
 	// Register remaining status providers.
-	httpServ.RegisterStatus("cluster", clstr)
+	httpServ.RegisterStatus("cluster", clstrServ)
+	httpServ.RegisterStatus("network", tcp.NetworkReporter{})
 
-	tlsConfig := tls.Config{InsecureSkipVerify: cfg.NoHTTPVerify}
-	if cfg.X509CACert != "" {
-		asn1Data, err := ioutil.ReadFile(cfg.X509CACert)
-		if err != nil {
-			log.Fatalf("ioutil.ReadFile failed: %s", err.Error())
-		}
-		tlsConfig.RootCAs = x509.NewCertPool()
-		ok := tlsConfig.RootCAs.AppendCertsFromPEM(asn1Data)
-		if !ok {
-			log.Fatalf("failed to parse root CA certificate(s) in %q", cfg.X509CACert)
-		}
+	// Prepare the cluster-joiner
+	joiner, err := createJoiner(cfg, credStr)
+	if err != nil {
+		log.Fatalf("failed to create cluster joiner: %s", err.Error())
 	}
 
 	// Create the cluster!
@@ -149,7 +172,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to get nodes %s", err.Error())
 	}
-	if err := createCluster(cfg, &tlsConfig, len(nodes) > 0, str, httpServ, credStr); err != nil {
+	if err := createCluster(cfg, len(nodes) > 0, joiner, str, httpServ, credStr); err != nil {
 		log.Fatalf("clustering failure: %s", err.Error())
 	}
 
@@ -158,10 +181,35 @@ func main() {
 	h, p, _ := net.SplitHostPort(cfg.HTTPAdv)
 	log.Printf("connect using the command-line tool via 'rqlite -H %s -p %s'", h, p)
 
+	// Start any requested auto-backups
+	backupSrvStx, backupSrvCancel := context.WithCancel(mainCtx)
+	backupSrv, err := startAutoBackups(backupSrvStx, cfg, str)
+	if err != nil {
+		log.Fatalf("failed to start auto-backups: %s", err.Error())
+	}
+	if backupSrv != nil {
+		httpServ.RegisterStatus("auto_backups", backupSrv)
+	}
+
 	// Block until signalled.
 	terminate := make(chan os.Signal, 1)
 	signal.Notify(terminate, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
-	<-terminate
+	sig := <-terminate
+	log.Printf(`received signal "%s", shutting down`, sig.String())
+
+	// Stop the HTTP server first, so clients get notification as soon as
+	// possible that the node is going away.
+	httpServ.Close()
+
+	if cfg.RaftClusterRemoveOnShutdown {
+		remover := cluster.NewRemover(clstrClient, 5*time.Second, str)
+		log.Printf("initiating removal of this node from cluster before shutdown")
+		if err := remover.Do(cfg.NodeID, true); err != nil {
+			log.Fatalf("failed to remove this node from cluster before shutdown: %s", err.Error())
+		} else {
+			log.Printf("removed this node successfully from cluster before shutdown")
+		}
+	}
 
 	if cfg.RaftStepdownOnShutdown {
 		if str.IsLeader() {
@@ -172,21 +220,80 @@ func main() {
 		str.Stepdown(true)
 	}
 
-	httpServ.Close()
+	backupSrvCancel()
 	if err := str.Close(true); err != nil {
 		log.Printf("failed to close store: %s", err.Error())
 	}
-	clstr.Close()
+	clstrServ.Close()
 	muxLn.Close()
 	stopProfile()
 	log.Println("rqlite server stopped")
 }
 
-func createStore(cfg *Config, ln *tcp.Layer) (*store.Store, error) {
-	dataPath, err := filepath.Abs(cfg.DataPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to determine absolute data path: %s", err.Error())
+func startAutoBackups(ctx context.Context, cfg *Config, str *store.Store) (*backup.Uploader, error) {
+	if cfg.AutoBackupFile == "" {
+		return nil, nil
 	}
+
+	b, err := backup.ReadConfigFile(cfg.AutoBackupFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read auto-backup file: %s", err.Error())
+	}
+
+	uCfg, s3cfg, err := backup.Unmarshal(b)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse auto-backup file: %s", err.Error())
+	}
+	sc := aws.NewS3Client(s3cfg.Endpoint, s3cfg.Region, s3cfg.AccessKeyID, s3cfg.SecretAccessKey,
+		s3cfg.Bucket, s3cfg.Path)
+	u := backup.NewUploader(sc, str, time.Duration(uCfg.Interval), !uCfg.NoCompress)
+	go u.Start(ctx, nil)
+	return u, nil
+}
+
+// downloadRestoreFile downloads the auto-restore file from the given URL, and returns the path to
+// the downloaded file. If the download fails, and the file is marked as continue-on-failure, then
+// the error is returned, but errOK is set to true. If the download fails, and the file is not
+// marked as continue-on-failure, then the error is returned, and errOK is set to false.
+func downloadRestoreFile(ctx context.Context, cfgPath string) (path string, errOK bool, err error) {
+	var f *os.File
+	defer func() {
+		if err != nil {
+			if f != nil {
+				f.Close()
+				os.Remove(f.Name())
+			}
+		}
+	}()
+
+	b, err := restore.ReadConfigFile(cfgPath)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to read auto-restore file: %s", err.Error())
+	}
+
+	dCfg, s3cfg, err := restore.Unmarshal(b)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to parse auto-restore file: %s", err.Error())
+	}
+	sc := aws.NewS3Client(s3cfg.Endpoint, s3cfg.Region, s3cfg.AccessKeyID, s3cfg.SecretAccessKey,
+		s3cfg.Bucket, s3cfg.Path)
+	d := restore.NewDownloader(sc)
+
+	// Create a temporary file to download to.
+	f, err = os.CreateTemp("", "rqlite-restore")
+	if err != nil {
+		return "", false, fmt.Errorf("failed to create temporary file: %s", err.Error())
+	}
+	defer f.Close()
+
+	if err := d.Do(ctx, f, time.Duration(dCfg.Timeout)); err != nil {
+		return "", dCfg.ContinueOnFailure, fmt.Errorf("failed to download auto-restore file: %s", err.Error())
+	}
+
+	return f.Name(), false, nil
+}
+
+func createStore(cfg *Config, ln *tcp.Layer) (*store.Store, error) {
 	dbConf := store.NewDBConfig(!cfg.OnDisk)
 	dbConf.OnDiskPath = cfg.OnDiskPath
 	dbConf.FKConstraints = cfg.FKConstraints
@@ -213,11 +320,10 @@ func createStore(cfg *Config, ln *tcp.Layer) (*store.Store, error) {
 	str.ReapTimeout = cfg.RaftReapNodeTimeout
 	str.ReapReadOnlyTimeout = cfg.RaftReapReadOnlyNodeTimeout
 
-	isNew := store.IsNewNode(dataPath)
-	if isNew {
-		log.Printf("no preexisting node state detected in %s, node may be bootstrapping", dataPath)
+	if store.IsNewNode(cfg.DataPath) {
+		log.Printf("no preexisting node state detected in %s, node may be bootstrapping", cfg.DataPath)
 	} else {
-		log.Printf("preexisting node state detected in %s", dataPath)
+		log.Printf("preexisting node state detected in %s", cfg.DataPath)
 	}
 
 	return str, nil
@@ -226,9 +332,8 @@ func createStore(cfg *Config, ln *tcp.Layer) (*store.Store, error) {
 func createDiscoService(cfg *Config, str *store.Store) (*disco.Service, error) {
 	var c disco.Client
 	var err error
-	var rc io.ReadCloser
 
-	rc = cfg.DiscoConfigReader()
+	rc := cfg.DiscoConfigReader()
 	defer func() {
 		if rc != nil {
 			rc.Close()
@@ -264,17 +369,14 @@ func createDiscoService(cfg *Config, str *store.Store) (*disco.Service, error) {
 }
 
 func startHTTPService(cfg *Config, str *store.Store, cltr *cluster.Client, credStr *auth.CredentialsStore) (*httpd.Service, error) {
-	// Create HTTP server and load authentication information if required.
-	var s *httpd.Service
-	if credStr != nil {
-		s = httpd.New(cfg.HTTPAddr, str, cltr, credStr)
-	} else {
-		s = httpd.New(cfg.HTTPAddr, str, cltr, nil)
-	}
+	// Create HTTP server and load authentication information.
+	s := httpd.New(cfg.HTTPAddr, str, cltr, credStr)
 
-	s.CertFile = cfg.X509Cert
-	s.KeyFile = cfg.X509Key
+	s.CACertFile = cfg.HTTPx509CACert
+	s.CertFile = cfg.HTTPx509Cert
+	s.KeyFile = cfg.HTTPx509Key
 	s.TLS1011 = cfg.TLS1011
+	s.ClientVerify = cfg.HTTPVerifyClient
 	s.Expvar = cfg.Expvar
 	s.Pprof = cfg.PprofEnabled
 	s.DefaultQueueCap = cfg.WriteQueueCap
@@ -300,16 +402,27 @@ func startNodeMux(cfg *Config, ln net.Listener) (*tcp.Mux, error) {
 	}
 
 	var mux *tcp.Mux
-	if cfg.NodeEncrypt {
-		log.Printf("enabling node-to-node encryption with cert: %s, key: %s", cfg.NodeX509Cert, cfg.NodeX509Key)
-		mux, err = tcp.NewTLSMux(ln, adv, cfg.NodeX509Cert, cfg.NodeX509Key, cfg.NodeX509CACert)
+	if cfg.NodeX509Cert != "" {
+		var b strings.Builder
+		b.WriteString(fmt.Sprintf("enabling node-to-node encryption with cert: %s, key: %s",
+			cfg.NodeX509Cert, cfg.NodeX509Key))
+		if cfg.NodeX509CACert != "" {
+			b.WriteString(fmt.Sprintf(", CA cert %s", cfg.NodeX509CACert))
+		}
+		if cfg.NodeVerifyClient {
+			b.WriteString(", mutual TLS disabled")
+		} else {
+			b.WriteString(", mutual TLS enabled")
+		}
+		log.Println(b.String())
+		mux, err = tcp.NewTLSMux(ln, adv, cfg.NodeX509Cert, cfg.NodeX509Key, cfg.NodeX509CACert,
+			cfg.NoNodeVerify, cfg.NodeVerifyClient)
 	} else {
 		mux, err = tcp.NewMux(ln, adv)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create node-to-node mux: %s", err.Error())
 	}
-	mux.InsecureSkipVerify = cfg.NoNodeVerify
 	go mux.Serve()
 
 	return mux, nil
@@ -319,50 +432,71 @@ func credentialStore(cfg *Config) (*auth.CredentialsStore, error) {
 	if cfg.AuthFile == "" {
 		return nil, nil
 	}
+	return auth.NewCredentialsStoreFromFile(cfg.AuthFile)
+}
 
-	f, err := os.Open(cfg.AuthFile)
+func createJoiner(cfg *Config, credStr *auth.CredentialsStore) (*cluster.Joiner, error) {
+	tlsConfig, err := createHTTPTLSConfig(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open authentication file %s: %s", cfg.AuthFile, err.Error())
-	}
-
-	cs := auth.NewCredentialsStore()
-	if err = cs.Load(f); err != nil {
 		return nil, err
 	}
-	return cs, nil
+	joiner := cluster.NewJoiner(cfg.JoinSrcIP, cfg.JoinAttempts, cfg.JoinInterval, tlsConfig)
+	if cfg.JoinAs != "" {
+		pw, ok := credStr.Password(cfg.JoinAs)
+		if !ok {
+			return nil, fmt.Errorf("user %s does not exist in credential store", cfg.JoinAs)
+		}
+		joiner.SetBasicAuth(cfg.JoinAs, pw)
+	}
+	return joiner, nil
 }
 
 func clusterService(cfg *Config, tn cluster.Transport, db cluster.Database, mgr cluster.Manager, credStr *auth.CredentialsStore) (*cluster.Service, error) {
 	c := cluster.New(tn, db, mgr, credStr)
 	c.SetAPIAddr(cfg.HTTPAdv)
-	c.EnableHTTPS(cfg.X509Cert != "" && cfg.X509Key != "") // Conditions met for an HTTPS API
-
+	c.EnableHTTPS(cfg.HTTPx509Cert != "" && cfg.HTTPx509Key != "") // Conditions met for an HTTPS API
 	if err := c.Open(); err != nil {
 		return nil, err
 	}
 	return c, nil
 }
 
-func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store.Store,
-	httpServ *httpd.Service, credStr *auth.CredentialsStore) error {
+func createClusterClient(cfg *Config, clstr *cluster.Service) (*cluster.Client, error) {
+	var dialerTLSConfig *tls.Config
+	var err error
+	if cfg.NodeX509Cert != "" || cfg.NodeX509CACert != "" {
+		dialerTLSConfig, err = rtls.CreateClientConfig(cfg.NodeX509Cert, cfg.NodeX509Key,
+			cfg.NodeX509CACert, cfg.NoNodeVerify, cfg.TLS1011)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create TLS config for cluster dialer: %s", err.Error())
+		}
+	}
+	clstrDialer := tcp.NewDialer(cluster.MuxClusterHeader, dialerTLSConfig)
+	clstrClient := cluster.NewClient(clstrDialer, cfg.ClusterConnectTimeout)
+	if err := clstrClient.SetLocal(cfg.RaftAdv, clstr); err != nil {
+		return nil, fmt.Errorf("failed to set cluster client local parameters: %s", err.Error())
+	}
+	return clstrClient, nil
+}
+
+func createCluster(cfg *Config, hasPeers bool, joiner *cluster.Joiner, str *store.Store, httpServ *httpd.Service, credStr *auth.CredentialsStore) error {
+	tlsConfig, err := createHTTPTLSConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create TLS client config for cluster: %s", err.Error())
+	}
+
 	joins := cfg.JoinAddresses()
 	if joins == nil && cfg.DiscoMode == "" && !hasPeers {
+		if cfg.RaftNonVoter {
+			return fmt.Errorf("cannot create a new non-voting node without joining it to an existing cluster")
+		}
+
 		// Brand new node, told to bootstrap itself. So do it.
 		log.Println("bootstraping single new node")
 		if err := str.Bootstrap(store.NewServer(str.ID(), cfg.RaftAdv, true)); err != nil {
 			return fmt.Errorf("failed to bootstrap single new node: %s", err.Error())
 		}
 		return nil
-	}
-
-	// Prepare the Joiner
-	joiner := cluster.NewJoiner(cfg.JoinSrcIP, cfg.JoinAttempts, cfg.JoinInterval, tlsConfig)
-	if cfg.JoinAs != "" {
-		pw, ok := credStr.Password(cfg.JoinAs)
-		if !ok {
-			return fmt.Errorf("user %s does not exist in credential store", cfg.JoinAs)
-		}
-		joiner.SetBasicAuth(cfg.JoinAs, pw)
 	}
 
 	// Prepare definition of being part of a cluster.
@@ -382,11 +516,6 @@ func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store
 	}
 
 	if joins != nil && cfg.BootstrapExpect > 0 {
-		if hasPeers {
-			log.Println("preexisting node configuration detected, ignoring bootstrap request")
-			return nil
-		}
-
 		// Bootstrap with explicit join addresses requests.
 		bs := cluster.NewBootstrapper(cluster.NewAddressProviderString(joins), tlsConfig)
 		if cfg.JoinAs != "" {
@@ -405,13 +534,12 @@ func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store
 		return nil
 	}
 
+	// DNS-based discovery requested. It's OK to proceed with this even if this node
+	// is already part of a cluster. Re-joining and re-notifying other nodes will be
+	// ignored when the node is already part of the cluster.
 	log.Printf("discovery mode: %s", cfg.DiscoMode)
 	switch cfg.DiscoMode {
 	case DiscoModeDNS, DiscoModeDNSSRV:
-		if hasPeers {
-			log.Printf("preexisting node configuration detected, ignoring %s option", cfg.DiscoMode)
-			return nil
-		}
 		rc := cfg.DiscoConfigReader()
 		defer func() {
 			if rc != nil {
@@ -454,45 +582,56 @@ func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store
 		if err != nil {
 			return fmt.Errorf("failed to start discovery service: %s", err.Error())
 		}
-
-		if !hasPeers {
-			log.Println("no preexisting nodes, registering with discovery service")
-
-			leader, addr, err := discoService.Register(str.ID(), cfg.HTTPURL(), cfg.RaftAdv)
-			if err != nil {
-				return fmt.Errorf("failed to register with discovery service: %s", err.Error())
-			}
-			if leader {
-				log.Println("node registered as leader using discovery service")
-				if err := str.Bootstrap(store.NewServer(str.ID(), str.Addr(), true)); err != nil {
-					return fmt.Errorf("failed to bootstrap single new node: %s", err.Error())
-				}
-			} else {
-				for {
-					log.Printf("discovery service returned %s as join address", addr)
-					if j, err := joiner.Do([]string{addr}, str.ID(), cfg.RaftAdv, !cfg.RaftNonVoter); err != nil {
-						log.Printf("failed to join cluster at %s: %s", addr, err.Error())
-
-						time.Sleep(time.Second)
-						_, addr, err = discoService.Register(str.ID(), cfg.HTTPURL(), cfg.RaftAdv)
-						if err != nil {
-							log.Printf("failed to get updated leader: %s", err.Error())
-						}
-						continue
-					} else {
-						log.Println("successfully joined cluster at", j)
-						break
-					}
-				}
-			}
-		} else {
-			log.Println("preexisting node configuration detected, not registering with discovery service")
-		}
+		// Safe to start reporting before doing registration. If the node hasn't bootstrapped
+		// yet, or isn't leader, reporting will just be a no-op until something changes.
 		go discoService.StartReporting(cfg.NodeID, cfg.HTTPURL(), cfg.RaftAdv)
 		httpServ.RegisterStatus("disco", discoService)
+
+		if hasPeers {
+			log.Printf("preexisting node configuration detected, not registering with discovery service")
+			return nil
+		}
+
+		log.Println("no preexisting nodes, registering with discovery service")
+
+		leader, addr, err := discoService.Register(str.ID(), cfg.HTTPURL(), cfg.RaftAdv)
+		if err != nil {
+			return fmt.Errorf("failed to register with discovery service: %s", err.Error())
+		}
+		if leader {
+			log.Println("node registered as leader using discovery service")
+			if err := str.Bootstrap(store.NewServer(str.ID(), str.Addr(), true)); err != nil {
+				return fmt.Errorf("failed to bootstrap single new node: %s", err.Error())
+			}
+		} else {
+			for {
+				log.Printf("discovery service returned %s as join address", addr)
+				if j, err := joiner.Do([]string{addr}, str.ID(), cfg.RaftAdv, !cfg.RaftNonVoter); err != nil {
+					log.Printf("failed to join cluster at %s: %s", addr, err.Error())
+
+					time.Sleep(time.Second)
+					_, addr, err = discoService.Register(str.ID(), cfg.HTTPURL(), cfg.RaftAdv)
+					if err != nil {
+						log.Printf("failed to get updated leader: %s", err.Error())
+					}
+					continue
+				} else {
+					log.Println("successfully joined cluster at", j)
+					break
+				}
+			}
+		}
 
 	default:
 		return fmt.Errorf("invalid disco mode %s", cfg.DiscoMode)
 	}
 	return nil
+}
+
+func createHTTPTLSConfig(cfg *Config) (*tls.Config, error) {
+	if cfg.HTTPx509Cert == "" && cfg.HTTPx509CACert == "" {
+		return nil, nil
+	}
+	return rtls.CreateClientConfig(cfg.HTTPx509Cert, cfg.HTTPx509Key, cfg.HTTPx509CACert,
+		cfg.NoHTTPVerify, cfg.TLS1011)
 }

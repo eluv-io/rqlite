@@ -11,10 +11,8 @@ import (
 var (
 	testStmtFoo        = &command.Statement{Sql: "SELECT * FROM foo"}
 	testStmtBar        = &command.Statement{Sql: "SELECT * FROM bar"}
-	testStmtQux        = &command.Statement{Sql: "SELECT * FROM qux"}
 	testStmtsFoo       = []*command.Statement{testStmtFoo}
 	testStmtsBar       = []*command.Statement{testStmtBar}
-	testStmtsNilFoo    = []*command.Statement{nil, testStmtFoo}
 	testStmtsFooBar    = []*command.Statement{testStmtFoo, testStmtBar}
 	testStmtsFooBarFoo = []*command.Statement{testStmtFoo, testStmtBar, testStmtFoo}
 	flushChan1         = make(FlushChannel)
@@ -55,13 +53,6 @@ func Test_MergeQueuedStatements(t *testing.T) {
 				{2, testStmtsBar, nil},
 			},
 			exp: &Request{2, testStmtsFooBar, nil},
-		},
-		{
-			qs: []*queuedStatements{
-				{1, testStmtsFooBar, nil},
-				{2, testStmtsFoo, nil},
-			},
-			exp: &Request{2, testStmtsFooBarFoo, nil},
 		},
 		{
 			qs: []*queuedStatements{
@@ -120,6 +111,17 @@ func Test_NewQueue(t *testing.T) {
 	defer q.Close()
 }
 
+func Test_NewQueueClosedWrite(t *testing.T) {
+	q := New(1, 1, 100*time.Millisecond)
+	if q == nil {
+		t.Fatalf("failed to create new Queue")
+	}
+	q.Close()
+	if _, err := q.Write(testStmtsFoo, nil); err == nil {
+		t.Fatalf("failed to detect closed queue")
+	}
+}
+
 func Test_NewQueueWriteNil(t *testing.T) {
 	q := New(1, 1, 60*time.Second)
 	defer q.Close()
@@ -145,7 +147,7 @@ func Test_NewQueueWriteBatchSizeSingle(t *testing.T) {
 		if req.Statements[0].Sql != "SELECT * FROM foo" {
 			t.Fatalf("received wrong SQL")
 		}
-	case <-time.NewTimer(5 * time.Second).C:
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for statement")
 	}
 }
@@ -170,7 +172,7 @@ func Test_NewQueueWriteBatchSizeDouble(t *testing.T) {
 		if req.Statements[0].Sql != "SELECT * FROM foo" {
 			t.Fatalf("received wrong SQL")
 		}
-	case <-time.NewTimer(5 * time.Second).C:
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for statement")
 	}
 	select {
@@ -181,7 +183,7 @@ func Test_NewQueueWriteBatchSizeDouble(t *testing.T) {
 		if req.Statements[0].Sql != "SELECT * FROM bar" {
 			t.Fatalf("received wrong SQL")
 		}
-	case <-time.NewTimer(5 * time.Second).C:
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for statement")
 	}
 }
@@ -203,7 +205,7 @@ func Test_NewQueueWriteNilAndOne(t *testing.T) {
 			t.Fatalf("received wrong length slice, exp %d, got %d", exp, got)
 		}
 		req.Close()
-	case <-time.NewTimer(5 * time.Second).C:
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for statement")
 	}
 }
@@ -226,7 +228,7 @@ func Test_NewQueueWriteBatchSizeSingleChan(t *testing.T) {
 			t.Fatalf("received wrong SQL")
 		}
 		req.Close()
-	case <-time.NewTimer(5 * time.Second).C:
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for statement")
 	}
 
@@ -257,7 +259,7 @@ func Test_NewQueueWriteNilSingleChan(t *testing.T) {
 			t.Fatalf("flush chans is not correct")
 		}
 		req.Close()
-	case <-time.NewTimer(5 * time.Second).C:
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for statement")
 	}
 
@@ -288,7 +290,7 @@ func Test_NewQueueWriteBatchSizeMulti(t *testing.T) {
 		if q.numTimeouts != 0 {
 			t.Fatalf("queue timeout expired?")
 		}
-	case <-time.NewTimer(5 * time.Second).C:
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for first statements")
 	}
 
@@ -306,7 +308,7 @@ func Test_NewQueueWriteBatchSizeMulti(t *testing.T) {
 		if q.numTimeouts != 0 {
 			t.Fatalf("queue timeout expired?")
 		}
-	case <-time.NewTimer(5 * time.Second).C:
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for second statements")
 	}
 }
@@ -330,7 +332,7 @@ func Test_NewQueueWriteTimeout(t *testing.T) {
 		if q.numTimeouts != 1 {
 			t.Fatalf("queue timeout didn't expire")
 		}
-	case <-time.NewTimer(5 * time.Second).C:
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for statement")
 	}
 }
@@ -355,7 +357,7 @@ func Test_NewQueueWriteTimeoutMulti(t *testing.T) {
 		if q.numTimeouts != 1 {
 			t.Fatalf("queue timeout didn't expire")
 		}
-	case <-time.NewTimer(5 * time.Second).C:
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for first statement")
 	}
 
@@ -373,7 +375,7 @@ func Test_NewQueueWriteTimeoutMulti(t *testing.T) {
 		if q.numTimeouts != 2 {
 			t.Fatalf("queue timeout didn't expire")
 		}
-	case <-time.NewTimer(5 * time.Second).C:
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for second statement")
 	}
 }
@@ -399,7 +401,7 @@ func Test_NewQueueWriteTimeoutBatch(t *testing.T) {
 		if q.numTimeouts != 1 {
 			t.Fatalf("queue timeout didn't expire")
 		}
-	case <-time.NewTimer(5 * time.Second).C:
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for statement")
 	}
 
@@ -421,7 +423,7 @@ func Test_NewQueueWriteTimeoutBatch(t *testing.T) {
 		if q.numTimeouts != 1 {
 			t.Fatalf("queue timeout expired?")
 		}
-	case <-time.NewTimer(5 * time.Second).C:
+	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for statement")
 	}
 }

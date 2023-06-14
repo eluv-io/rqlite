@@ -25,7 +25,7 @@ var (
 
 // ParseRequest generates a set of Statements for a given byte slice.
 func ParseRequest(b []byte) ([]*command.Statement, error) {
-	if b == nil {
+	if len(b) == 0 {
 		return nil, ErrNoStatements
 	}
 
@@ -98,6 +98,8 @@ func ParseRequest(b []byte) ([]*command.Statement, error) {
 }
 
 func makeParameter(name string, i interface{}) (*command.Parameter, error) {
+	// Check if the value is a JSON number, and if so, convert it to an int64 or float64.
+	// Then let the switch statement below handle it.
 	if num, ok := i.(json.Number); ok {
 		i64, err := num.Int64()
 		if err == nil {
@@ -105,7 +107,7 @@ func makeParameter(name string, i interface{}) (*command.Parameter, error) {
 		} else {
 			f64, err := num.Float64()
 			if err != nil {
-				return nil, errors.New(fmt.Sprintf("invalid number %s", num.String()))
+				return nil, fmt.Errorf("invalid number %s", num.String())
 			}
 			i = f64
 		}
@@ -113,6 +115,12 @@ func makeParameter(name string, i interface{}) (*command.Parameter, error) {
 
 	switch v := i.(type) {
 	case int:
+		return &command.Parameter{
+			Value: &command.Parameter_I{
+				I: int64(v),
+			},
+			Name: name,
+		}, nil
 	case int64:
 		return &command.Parameter{
 			Value: &command.Parameter_I{
@@ -149,7 +157,10 @@ func makeParameter(name string, i interface{}) (*command.Parameter, error) {
 			Name: name,
 		}, nil
 	case nil:
-		return nil, nil
+		return &command.Parameter{
+			Value: nil,
+			Name:  name,
+		}, nil
 	}
 	return nil, ErrUnsupportedType
 }

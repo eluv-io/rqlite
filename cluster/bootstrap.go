@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	rurl "github.com/rqlite/rqlite/v7/http/url"
@@ -25,6 +26,39 @@ var (
 	// complete within the timeout.
 	ErrBootTimeout = errors.New("boot timeout")
 )
+
+// BootStatus is the reason the boot process completed.
+type BootStatus int
+
+const (
+	// BootUnknown is the initial state of the boot process.
+	BootUnknown BootStatus = iota
+
+	// BootJoin means boot completed due to a successful join.
+	BootJoin
+
+	// BootDone means boot completed due to Done being "true".
+	BootDone
+
+	// BootTimeout means the boot process timed out.
+	BootTimeout
+)
+
+// String returns a string representation of the BootStatus.
+func (b BootStatus) String() string {
+	switch b {
+	case BootUnknown:
+		return "unknown"
+	case BootJoin:
+		return "join"
+	case BootDone:
+		return "done"
+	case BootTimeout:
+		return "timeout"
+	default:
+		panic("unknown boot status")
+	}
+}
 
 // AddressProvider is the interface types must implement to provide
 // addresses to a Bootstrapper.
@@ -42,23 +76,23 @@ type Bootstrapper struct {
 	username string
 	password string
 
-	logger      *log.Logger
-	Interval    time.Duration
+	logger   *log.Logger
+	Interval time.Duration
 	MaxInterval time.Duration
+
+	bootStatusMu sync.RWMutex
+	bootStatus   BootStatus
 }
 
 // NewBootstrapper returns an instance of a Bootstrapper.
 func NewBootstrapper(p AddressProvider, tlsConfig *tls.Config) *Bootstrapper {
 	bs := &Bootstrapper{
-		provider:    p,
-		tlsConfig:   &tls.Config{InsecureSkipVerify: true},
-		joiner:      NewJoiner("", 1, 0, tlsConfig),
-		logger:      log.New(os.Stderr, "[cluster-bootstrap] ", log.LstdFlags),
-		Interval:    2 * time.Second,
+		provider:  p,
+		tlsConfig: tlsConfig,
+		joiner:    NewJoiner("", 1, 0, tlsConfig),
+		logger:    log.New(os.Stderr, "[cluster-bootstrap] ", log.LstdFlags),
+		Interval:  2 * time.Second,
 		MaxInterval: 1 * time.Minute,
-	}
-	if tlsConfig != nil {
-		bs.tlsConfig = tlsConfig
 	}
 	return bs
 }
@@ -99,11 +133,13 @@ func (b *Bootstrapper) Boot(id, raftAddr string, done func() bool, timeout time.
 	for {
 		select {
 		case <-timeoutT.C:
+			b.setBootStatus(BootTimeout)
 			return ErrBootTimeout
 
 		case <-tickerT.C:
 			if done() {
 				b.logger.Printf("boot operation marked done")
+				b.setBootStatus(BootDone)
 				return nil
 			}
 
@@ -128,6 +164,7 @@ func (b *Bootstrapper) Boot(id, raftAddr string, done func() bool, timeout time.
 			b.joiner.SetBasicAuth(b.username, b.password)
 			if j, err := b.joiner.Do(targets, id, raftAddr, true); err == nil {
 				b.logger.Printf("succeeded directly joining cluster via node at %s", j)
+				b.setBootStatus(BootJoin)
 				return nil
 			}
 
@@ -135,7 +172,7 @@ func (b *Bootstrapper) Boot(id, raftAddr string, done func() bool, timeout time.
 			// in the targets list. This could be because none of the nodes are contactable,
 			// or none of the nodes are in a functioning cluster with a leader. That means that
 			// this node could be part of a set nodes that are bootstrapping to form a cluster
-			// de novo. For that to happen it needs to now let the otehr nodes know it is here.
+			// de novo. For that to happen it needs to now let the other nodes know it is here.
 			// If this is a new cluster, some node will then reach the bootstrap-expect value,
 			// form the cluster, beating all other nodes to it.
 			if err := b.notify(targets, id, raftAddr); err != nil {
@@ -148,10 +185,18 @@ func (b *Bootstrapper) Boot(id, raftAddr string, done func() bool, timeout time.
 	}
 }
 
+// Status returns the reason for the boot process completing.
+func (b *Bootstrapper) Status() BootStatus {
+	b.bootStatusMu.RLock()
+	defer b.bootStatusMu.RUnlock()
+	return b.bootStatus
+}
+
 func (b *Bootstrapper) notify(targets []string, id, raftAddr string) error {
 	// Create and configure the client to connect to the other node.
 	tr := &http.Transport{
-		TLSClientConfig: b.tlsConfig,
+		TLSClientConfig:   b.tlsConfig,
+		ForceAttemptHTTP2: true,
 	}
 	client := &http.Client{Transport: tr}
 
@@ -207,6 +252,12 @@ func (b *Bootstrapper) notify(targets []string, id, raftAddr string) error {
 		}
 	}
 	return nil
+}
+
+func (b *Bootstrapper) setBootStatus(status BootStatus) {
+	b.bootStatusMu.Lock()
+	defer b.bootStatusMu.Unlock()
+	b.bootStatus = status
 }
 
 type stringAddressProvider struct {

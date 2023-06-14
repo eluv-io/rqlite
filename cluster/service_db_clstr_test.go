@@ -296,7 +296,7 @@ func Test_ServiceBackup(t *testing.T) {
 		t.Fatalf("failed to backup database: %s", err.Error())
 	}
 
-	if bytes.Compare(buf.Bytes(), testData) != 0 {
+	if !bytes.Equal(buf.Bytes(), testData) {
 		t.Fatalf("backup data is not as expected, exp: %s, got: %s", testData, buf.Bytes())
 	}
 
@@ -332,7 +332,7 @@ func Test_ServiceLoad(t *testing.T) {
 	testData := []byte("this is SQLite data")
 	db.loadFn = func(lr *command.LoadRequest) error {
 		called = true
-		if bytes.Compare(lr.Data, testData) != 0 {
+		if !bytes.Equal(lr.Data, testData) {
 			t.Fatalf("load data is not as expected, exp: %s, got: %s", testData, lr.Data)
 		}
 		return nil
@@ -458,10 +458,21 @@ func queryRequestFromStrings(s []string) *command.QueryRequest {
 	}
 }
 
-func backupRequestSQL(leader bool) *command.BackupRequest {
-	return &command.BackupRequest{
-		Format: command.BackupRequest_BACKUP_REQUEST_FORMAT_SQL,
-		Leader: leader,
+func executeQueryRequestFromString(s string) *command.ExecuteQueryRequest {
+	return executeQueryRequestFromStrings([]string{s})
+}
+
+func executeQueryRequestFromStrings(s []string) *command.ExecuteQueryRequest {
+	stmts := make([]*command.Statement, len(s))
+	for i := range s {
+		stmts[i] = &command.Statement{
+			Sql: s[i],
+		}
+	}
+	return &command.ExecuteQueryRequest{
+		Request: &command.Request{
+			Statements: stmts,
+		},
 	}
 }
 
