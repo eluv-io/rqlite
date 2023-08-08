@@ -189,6 +189,7 @@ func createStore(cfg *Config, ln *tcp.Layer) (*store.Store, error) {
 	dbConf := store.NewDBConfig(!cfg.OnDisk)
 	dbConf.OnDiskPath = cfg.OnDiskPath
 	dbConf.FKConstraints = cfg.FKConstraints
+	dbConf.DisableWAL = cfg.DisableWAL
 
 	str := store.New(ln, &store.Config{
 		DBConf: dbConf,
@@ -198,7 +199,6 @@ func createStore(cfg *Config, ln *tcp.Layer) (*store.Store, error) {
 	})
 
 	// Set optional parameters on store.
-	str.StartupOnDisk = cfg.OnDiskStartup
 	str.SetRequestCompression(cfg.CompressionBatch, cfg.CompressionSize)
 	str.RaftLogLevel = cfg.RaftLogLevel
 	str.RaftLogger = cfg.HcLogger

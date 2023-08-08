@@ -187,11 +187,11 @@ type Config struct {
 	// OnDiskPath sets the path to the SQLite file. May not be set.
 	OnDiskPath string
 
-	// OnDiskStartup disables the in-memory on-disk startup optimization.
-	OnDiskStartup bool
-
 	// FKConstraints enables SQLite foreign key constraints.
 	FKConstraints bool
+
+	// Disable WAL mode if running in on-disk mode
+	DisableWAL bool
 
 	// RaftLogLevel sets the minimum logging level for the Raft subsystem.
 	RaftLogLevel string

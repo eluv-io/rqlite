@@ -3,7 +3,6 @@ package system
 import (
 	"fmt"
 	"net"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -203,7 +202,7 @@ func Test_MultiNodeClusterRANDOM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to query for count: %s", err.Error())
 	}
-	if got, exp := r, `{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[1]]}]}`; got != exp {
+	if got, exp := r, `{"results":[{"columns":["COUNT(*)"],"types":["integer"],"values":[[1]]}]}`; got != exp {
 		t.Fatalf("wrong query results, exp %s, got %s", exp, got)
 	}
 
@@ -778,12 +777,13 @@ func Test_MultiNodeClusterQueuedWrites(t *testing.T) {
 	// Write data to the cluster, via various methods and nodes.
 	writesPerLoop := 500
 	var wg sync.WaitGroup
-	wg.Add(5)
+	numLoops := 5
+	wg.Add(numLoops)
 	go func() {
 		defer wg.Done()
 		for i := 0; i < writesPerLoop; i++ {
 			if _, err := node1.Execute(`INSERT INTO foo(name) VALUES("fiona")`); err != nil {
-				t.Logf("failed to insert records: %s", err.Error())
+				t.Errorf("failed to insert records: %s", err.Error())
 			}
 		}
 	}()
@@ -791,7 +791,7 @@ func Test_MultiNodeClusterQueuedWrites(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < writesPerLoop; i++ {
 			if _, err := node2.Execute(`INSERT INTO foo(name) VALUES("fiona")`); err != nil {
-				t.Logf("failed to insert records: %s", err.Error())
+				t.Errorf("failed to insert records: %s", err.Error())
 			}
 		}
 	}()
@@ -799,38 +799,38 @@ func Test_MultiNodeClusterQueuedWrites(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < writesPerLoop-1; i++ {
 			if _, err := node2.ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, false); err != nil {
-				t.Logf("failed to insert records: %s", err.Error())
+				t.Errorf("failed to insert records: %s\n", err.Error())
 			}
 		}
 		if _, err := node2.ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, true); err != nil {
-			t.Logf("failed to insert records: %s", err.Error())
+			t.Errorf("failed to insert records: %s\n", err.Error())
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		for i := 0; i < writesPerLoop-1; i++ {
 			if _, err := node3.ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, false); err != nil {
-				t.Logf("failed to insert records: %s", err.Error())
+				t.Errorf("failed to insert records: %s\n", err.Error())
 			}
 		}
 		if _, err := node3.ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, true); err != nil {
-			t.Logf("failed to insert records: %s", err.Error())
+			t.Errorf("failed to insert records: %s\n", err.Error())
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		for i := 0; i < writesPerLoop-1; i++ {
 			if _, err := node3.ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, false); err != nil {
-				t.Logf("failed to insert records: %s", err.Error())
+				t.Errorf("failed to insert records: %s\n", err.Error())
 			}
 		}
 		if _, err := node3.ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, true); err != nil {
-			t.Logf("failed to insert records: %s", err.Error())
+			t.Errorf("failed to insert records: %s", err.Error())
 		}
 	}()
 	wg.Wait()
 
-	exp := fmt.Sprintf(`{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[%d]]}]}`, 5*writesPerLoop)
+	exp := fmt.Sprintf(`{"results":[{"columns":["COUNT(*)"],"types":["integer"],"values":[[%d]]}]}`, numLoops*writesPerLoop)
 	got, err := node1.Query(`SELECT COUNT(*) FROM foo`)
 	if err != nil {
 		t.Fatalf("failed to query follower node: %s", err.Error())
@@ -843,12 +843,6 @@ func Test_MultiNodeClusterQueuedWrites(t *testing.T) {
 // Test_MultiNodeClusterLargeQueuedWrites tests writing to a cluster using
 // many large concurrent Queued Writes operations.
 func Test_MultiNodeClusterLargeQueuedWrites(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		// https://github.com/rqlite/rqlite/issues/1123
-		// This is not great, but extensive testing on Windows has not been
-		// successful yet, so skip this test for now.
-		t.Skip("skipping test on windows")
-	}
 	store.ResetStats()
 	db.ResetStats()
 	http.ResetStats()
@@ -884,25 +878,29 @@ func Test_MultiNodeClusterLargeQueuedWrites(t *testing.T) {
 	// Write data to the cluster, via various nodes.
 	nodesUnderTest := []*Node{node3, node1, node2, node1, node2, node3, node1, node3, node2}
 	writesPerNode := 10000
+	writeBandBase := writesPerNode * 10
 
 	var wg sync.WaitGroup
 	wg.Add(len(nodesUnderTest))
-	for _, n := range nodesUnderTest {
-		go func(nt *Node) {
+	for i, n := range nodesUnderTest {
+		go func(ii int, nt *Node) {
 			defer wg.Done()
-			for i := 0; i < writesPerNode-1; i++ {
-				if _, err := nt.ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, false); err != nil {
+			var j int
+			for j = 0; j < writesPerNode-1; j++ {
+				stmt := fmt.Sprintf(`INSERT OR IGNORE INTO foo(id, name) VALUES(%d, "fiona")`, j+(ii*writeBandBase))
+				if _, err := nt.ExecuteQueued(stmt, false); err != nil {
 					t.Logf("failed to insert records: %s", err.Error())
 				}
 			}
-			if _, err := nt.ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, true); err != nil {
+			stmt := fmt.Sprintf(`INSERT OR IGNORE INTO foo(id, name) VALUES(%d, "fiona")`, j+(ii*writeBandBase))
+			if _, err := nt.ExecuteQueued(stmt, true); err != nil {
 				t.Logf("failed to insert records: %s", err.Error())
 			}
-		}(n)
+		}(i, n)
 	}
 	wg.Wait()
 
-	exp := fmt.Sprintf(`{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[%d]]}]}`, len(nodesUnderTest)*writesPerNode)
+	exp := fmt.Sprintf(`{"results":[{"columns":["COUNT(*)"],"types":["integer"],"values":[[%d]]}]}`, len(nodesUnderTest)*writesPerNode)
 	got, err := node1.Query(`SELECT COUNT(*) FROM foo`)
 	if err != nil {
 		t.Fatalf("failed to query follower node: %s", err.Error())
@@ -1187,7 +1185,7 @@ func Test_MultiNodeClusterSnapshot(t *testing.T) {
 				t.Fatalf("failed to query follower node: %s", err.Error())
 			}
 
-			if r != `{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[300]]}]}` {
+			if r != `{"results":[{"columns":["COUNT(*)"],"types":["integer"],"values":[[300]]}]}` {
 				if n < 20 {
 					// Wait, and try again.
 					time.Sleep(mustParseDuration("1s"))
@@ -1219,7 +1217,7 @@ func Test_MultiNodeClusterSnapshot(t *testing.T) {
 			t.Fatalf("failed to query follower node: %s", err.Error())
 		}
 
-		if r != `{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[300]]}]}` {
+		if r != `{"results":[{"columns":["COUNT(*)"],"types":["integer"],"values":[[300]]}]}` {
 			if n < 10 {
 				// Wait, and try again.
 				time.Sleep(mustParseDuration("100ms"))
@@ -1383,7 +1381,7 @@ func Test_MultiNodeClusterRecoverSingle(t *testing.T) {
 	if _, err := node1.Execute(`INSERT INTO foo(id, name) VALUES(1, "fiona")`); err != nil {
 		t.Fatalf("failed to create table: %s", err.Error())
 	}
-	if rows, _ := node1.Query(`SELECT COUNT(*) FROM foo`); rows != `{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[1]]}]}` {
+	if rows, _ := node1.Query(`SELECT COUNT(*) FROM foo`); rows != `{"results":[{"columns":["COUNT(*)"],"types":["integer"],"values":[[1]]}]}` {
 		t.Fatalf("got incorrect results from node: %s", rows)
 	}
 
@@ -1441,7 +1439,7 @@ func Test_MultiNodeClusterRecoverSingle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed waiting for leader: %s", err.Error())
 	}
-	if rows, _ := okSingle.Query(`SELECT COUNT(*) FROM foo`); rows != `{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[1]]}]}` {
+	if rows, _ := okSingle.Query(`SELECT COUNT(*) FROM foo`); rows != `{"results":[{"columns":["COUNT(*)"],"types":["integer"],"values":[[1]]}]}` {
 		t.Fatalf("got incorrect results from recovered node: %s", rows)
 	}
 	okSingle.Close(true)
@@ -1486,7 +1484,7 @@ func Test_MultiNodeClusterRecoverFull(t *testing.T) {
 	if _, err := node1.Execute(`INSERT INTO foo(id, name) VALUES(1, "fiona")`); err != nil {
 		t.Fatalf("failed to create table: %s", err.Error())
 	}
-	if rows, _ := node1.Query(`SELECT COUNT(*) FROM foo`); rows != `{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[1]]}]}` {
+	if rows, _ := node1.Query(`SELECT COUNT(*) FROM foo`); rows != `{"results":[{"columns":["COUNT(*)"],"types":["integer"],"values":[[1]]}]}` {
 		t.Fatalf("got incorrect results from node: %s", rows)
 	}
 
@@ -1534,7 +1532,7 @@ func Test_MultiNodeClusterRecoverFull(t *testing.T) {
 		t.Fatalf("failed waiting for leader on recovered cluster: %s", err.Error())
 	}
 
-	if rows, _ := node4.Query(`SELECT COUNT(*) FROM foo`); rows != `{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[1]]}]}` {
+	if rows, _ := node4.Query(`SELECT COUNT(*) FROM foo`); rows != `{"results":[{"columns":["COUNT(*)"],"types":["integer"],"values":[[1]]}]}` {
 		t.Fatalf("got incorrect results from recovered node: %s", rows)
 	}
 }

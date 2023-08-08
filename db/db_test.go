@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"sync"
@@ -54,6 +55,24 @@ func Test_ReturningClause(t *testing.T) {
 	if len(rows.GetValues()) != 1 && len(rows.GetValues()[0].GetParameters()) != 1 &&
 		rows.GetValues()[0].GetParameters()[0].GetI() != int64(1) {
 		t.Fatalf("expected returned value 1")
+	}
+}
+
+func Test_RemoveFiles(t *testing.T) {
+	d := t.TempDir()
+	mustCreateClosedFile(fmt.Sprintf("%s/foo", d))
+	mustCreateClosedFile(fmt.Sprintf("%s/foo-wal", d))
+
+	if err := RemoveFiles(fmt.Sprintf("%s/foo", d)); err != nil {
+		t.Fatalf("failed to remove files: %s", err.Error())
+	}
+
+	files, err := ioutil.ReadDir(d)
+	if err != nil {
+		t.Fatalf("failed to read directory: %s", err.Error())
+	}
+	if len(files) != 0 {
+		t.Fatalf("expected directory to be empty, but wasn't")
 	}
 }
 
@@ -153,7 +172,7 @@ func Test_ConcurrentQueriesInMemory(t *testing.T) {
 			if err != nil {
 				t.Logf("failed to query table: %s", err.Error())
 			}
-			if exp, got := `[{"columns":["COUNT(*)"],"types":[""],"values":[[5000]]}]`, asJSON(ro); exp != got {
+			if exp, got := `[{"columns":["COUNT(*)"],"types":["integer"],"values":[[5000]]}]`, asJSON(ro); exp != got {
 				t.Logf("unexpected results for query\nexp: %s\ngot: %s", exp, got)
 			}
 		}()
@@ -162,7 +181,7 @@ func Test_ConcurrentQueriesInMemory(t *testing.T) {
 }
 
 func Test_SimpleTransaction(t *testing.T) {
-	db, path := mustCreateDatabase()
+	db, path := mustCreateOnDiskDatabase()
 	defer db.Close()
 	defer os.Remove(path)
 
@@ -205,7 +224,7 @@ func Test_SimpleTransaction(t *testing.T) {
 }
 
 func Test_PartialFailTransaction(t *testing.T) {
-	db, path := mustCreateDatabase()
+	db, path := mustCreateOnDiskDatabase()
 	defer db.Close()
 	defer os.Remove(path)
 
@@ -247,13 +266,24 @@ func Test_PartialFailTransaction(t *testing.T) {
 	}
 }
 
-func mustCreateDatabase() (*DB, string) {
+func mustCreateOnDiskDatabase() (*DB, string) {
 	var err error
 	f := mustTempFile()
-	db, err := Open(f, false)
+	db, err := Open(f, false, false)
 	fmt.Println("db file", f)
 	if err != nil {
-		panic("failed to open database")
+		panic("failed to open database in DELETE mode")
+	}
+
+	return db, f
+}
+
+func mustCreateOnDiskDatabaseWAL() (*DB, string) {
+	var err error
+	f := mustTempFile()
+	db, err := Open(f, false, true)
+	if err != nil {
+		panic("failed to open database in WAL mode")
 	}
 
 	return db, f
@@ -305,4 +335,53 @@ func mustTempFile() string {
 	}
 	tmpfile.Close()
 	return tmpfile.Name()
+}
+
+func mustTempDir() string {
+	tmpdir, err := ioutil.TempDir("", "rqlite-db-test")
+	if err != nil {
+		panic(err.Error())
+	}
+	return tmpdir
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// function which copies a src file to a dst file, panics if any error
+func mustCopyFile(dst, src string) {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		panic(err)
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		panic(err)
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func mustRenameFile(oldpath, newpath string) {
+	if err := os.Rename(oldpath, newpath); err != nil {
+		panic(err)
+	}
+}
+
+func mustCreateClosedFile(path string) {
+	f, err := os.Create(path)
+	if err != nil {
+		panic("failed to create file")
+	}
+	if err := f.Close(); err != nil {
+		panic("failed to close file")
+	}
 }

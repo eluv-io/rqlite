@@ -39,10 +39,15 @@ func Test_TableCreationInMemory(t *testing.T) {
 	if exp, got := `[{"columns":["id","name"],"types":["integer","text"]}]`, asJSON(q); exp != got {
 		t.Fatalf("unexpected results for query, expected %s, got %s", exp, got)
 	}
+
+	// Confirm checkpoint works without error on an in-memory database. It should just be ignored.
+	if err := db.Checkpoint(5 * time.Second); err != nil {
+		t.Fatalf("failed to checkpoint in-memory database: %s", err.Error())
+	}
 }
 
 func Test_LoadIntoMemory(t *testing.T) {
-	db, path := mustCreateDatabase()
+	db, path := mustCreateOnDiskDatabase()
 	defer db.Close()
 	defer os.Remove(path)
 
@@ -59,7 +64,7 @@ func Test_LoadIntoMemory(t *testing.T) {
 		t.Fatalf("unexpected results for query, expected %s, got %s", exp, got)
 	}
 
-	inmem, err := LoadIntoMemory(path, false)
+	inmem, err := LoadIntoMemory(path, false, false)
 	if err != nil {
 		t.Fatalf("failed to create loaded in-memory database: %s", err.Error())
 	}
@@ -75,7 +80,7 @@ func Test_LoadIntoMemory(t *testing.T) {
 }
 
 func Test_DeserializeIntoMemory(t *testing.T) {
-	db, path := mustCreateDatabase()
+	db, path := mustCreateOnDiskDatabase()
 	defer db.Close()
 	defer os.Remove(path)
 
@@ -145,7 +150,7 @@ func Test_DeserializeIntoMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to query table: %s", err.Error())
 	}
-	if exp, got := `[{"columns":["COUNT(*)"],"types":[""],"values":[[5004]]}]`, asJSON(ro); exp != got {
+	if exp, got := `[{"columns":["COUNT(*)"],"types":["integer"],"values":[[5004]]}]`, asJSON(ro); exp != got {
 		t.Fatalf("unexpected results for query\nexp: %s\ngot: %s", exp, got)
 	}
 }

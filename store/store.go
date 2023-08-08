@@ -5,15 +5,12 @@ package store
 
 import (
 	"bytes"
-	"compress/gzip"
-	"encoding/binary"
 	"errors"
 	"expvar"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
-	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -22,13 +19,13 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/rqlite/rqlite/v7/command"
 	sql "github.com/rqlite/rqlite/v7/db"
 	rlog "github.com/rqlite/rqlite/v7/log"
+	"github.com/rqlite/rqlite/v7/snapshot"
 )
 
 var (
@@ -67,20 +64,21 @@ var (
 )
 
 const (
-	raftDBPath          = "raft.db" // Changing this will break backwards compatibility.
-	peersPath           = "raft/peers.json"
-	peersInfoPath       = "raft/peers.info"
-	retainSnapshotCount = 2
-	applyTimeout        = 10 * time.Second
-	openTimeout         = 120 * time.Second
-	sqliteFile          = "db.sqlite"
-	leaderWaitDelay     = 100 * time.Millisecond
-	appliedWaitDelay    = 100 * time.Millisecond
-	connectionPoolCount = 5
-	connectionTimeout   = 10 * time.Second
-	raftLogCacheSize    = 512
-	trailingScale       = 1.25
-	observerChanLen     = 50
+	raftDBPath                 = "raft.db" // Changing this will break backwards compatibility.
+	peersPath                  = "raft/peers.json"
+	peersInfoPath              = "raft/peers.info"
+	retainSnapshotCount        = 1
+	applyTimeout               = 10 * time.Second
+	openTimeout                = 120 * time.Second
+	sqliteFile                 = "db.sqlite"
+	leaderWaitDelay            = 100 * time.Millisecond
+	appliedWaitDelay           = 100 * time.Millisecond
+	appliedIndexUpdateInterval = 5 * time.Second
+	connectionPoolCount        = 5
+	connectionTimeout          = 10 * time.Second
+	raftLogCacheSize           = 512
+	trailingScale              = 1.25
+	observerChanLen            = 50
 )
 
 const (
@@ -98,6 +96,7 @@ const (
 	numJoins                 = "num_joins"
 	numIgnoredJoins          = "num_ignored_joins"
 	numRemovedBeforeJoins    = "num_removed_before_joins"
+	numDBStatsErrors         = "num_db_stats_errors"
 	snapshotCreateDuration   = "snapshot_create_duration"
 	snapshotPersistDuration  = "snapshot_persist_duration"
 	snapshotDBSerializedSize = "snapshot_db_serialized_size"
@@ -133,6 +132,7 @@ func ResetStats() {
 	stats.Add(numJoins, 0)
 	stats.Add(numIgnoredJoins, 0)
 	stats.Add(numRemovedBeforeJoins, 0)
+	stats.Add(numDBStatsErrors, 0)
 	stats.Add(snapshotCreateDuration, 0)
 	stats.Add(snapshotPersistDuration, 0)
 	stats.Add(snapshotDBSerializedSize, 0)
@@ -176,8 +176,9 @@ type Store struct {
 
 	queryTxMu sync.RWMutex
 
-	dbAppliedIndexMu sync.RWMutex
-	dbAppliedIndex   uint64
+	dbAppliedIndexMu     sync.RWMutex
+	dbAppliedIndex       uint64
+	appliedIdxUpdateDone chan struct{}
 
 	// Channels that must be closed for the Store to be considered ready.
 	readyChans             []<-chan struct{}
@@ -203,10 +204,10 @@ type Store struct {
 	observer          *raft.Observer
 
 	onDiskCreated        bool      // On disk database actually created?
-	snapsExistOnOpen     bool      // Any snaps present when store opens?
 	firstIdxOnOpen       uint64    // First index on log when Store opens.
 	lastIdxOnOpen        uint64    // Last index on log when Store opens.
-	lastCommandIdxOnOpen uint64    // Last command index on log when Store opens.
+	lastCommandIdxOnOpen uint64    // Last command index before applied index when Store opens.
+	lastAppliedIdxOnOpen uint64    // Last applied index on log when Store opens.
 	firstLogAppliedT     time.Time // Time first log is applied
 	appliedOnOpen        uint64    // Number of logs applied at open.
 	openT                time.Time // Timestamp when Store opens.
@@ -217,14 +218,6 @@ type Store struct {
 	BootstrapExpect int
 	bootstrapped    bool
 	notifyingNodes  map[string]*Server
-
-	// StartupOnDisk disables in-memory initialization of on-disk databases.
-	// Restarting a node with an on-disk database can be slow so, by default,
-	// rqlite creates on-disk databases in memory first, and then moves the
-	// database to disk before Raft starts. However, this optimization can
-	// prevent nodes with very large (2GB+) databases from starting. This
-	// flag allows control of the optimization.
-	StartupOnDisk bool
 
 	ShutdownOnRemove   bool
 	SnapshotThreshold  uint64
@@ -336,17 +329,16 @@ func (s *Store) Open() (retErr error) {
 	s.openT = time.Now()
 	s.logger.Printf("opening store with node ID %s", s.raftID)
 
-	if !s.dbConf.Memory {
+	if s.dbConf.Memory {
+		s.logger.Printf("configured for an in-memory database")
+	} else {
 		s.logger.Printf("configured for an on-disk database at %s", s.dbPath)
-		s.logger.Printf("on-disk database in-memory creation %s", enabledFromBool(!s.StartupOnDisk))
 		parentDir := filepath.Dir(s.dbPath)
 		s.logger.Printf("ensuring directory for on-disk database exists at %s", parentDir)
 		err := os.MkdirAll(parentDir, 0755)
 		if err != nil {
 			return err
 		}
-	} else {
-		s.logger.Printf("configured for an in-memory database")
 	}
 
 	// Create all the required Raft directories.
@@ -377,7 +369,6 @@ func (s *Store) Open() (retErr error) {
 		return fmt.Errorf("list snapshots: %s", err)
 	}
 	s.logger.Printf("%d preexisting snapshots present", len(snaps))
-	s.snapsExistOnOpen = len(snaps) > 0
 
 	// Create the log store and stable store.
 	s.boltStore, err = rlog.New(filepath.Join(s.raftDir, raftDBPath), s.NoFreeListSync)
@@ -397,7 +388,7 @@ func (s *Store) Open() (retErr error) {
 		if err != nil {
 			return fmt.Errorf("failed to read peers file: %s", err.Error())
 		}
-		if err = RecoverNode(s.raftDir, s.logger, s.raftLog, s.raftStable, snapshots, s.raftTn, config); err != nil {
+		if err = RecoverNode(s.raftDir, s.logger, s.raftLog, s.boltStore, snapshots, s.raftTn, config); err != nil {
 			return fmt.Errorf("failed to recover node: %s", err.Error())
 		}
 		if err := os.Rename(s.peersPath, s.peersInfoPath); err != nil {
@@ -411,28 +402,22 @@ func (s *Store) Open() (retErr error) {
 	if err := s.setLogInfo(); err != nil {
 		return fmt.Errorf("set log info: %s", err)
 	}
-	s.logger.Printf("first log index: %d, last log index: %d, last command log index: %d:",
-		s.firstIdxOnOpen, s.lastIdxOnOpen, s.lastCommandIdxOnOpen)
+	s.logger.Printf("first log index: %d, last log index: %d, last applied index: %d, last command log index: %d:",
+		s.firstIdxOnOpen, s.lastIdxOnOpen, s.lastAppliedIdxOnOpen, s.lastCommandIdxOnOpen)
 
-	// If an on-disk database has been requested, and there are no snapshots, and
-	// there are no commands in the log, then this is the only opportunity to
-	// create that on-disk database file before Raft initializes. In addition, this
-	// can also happen if the user explicitly disables the startup optimization of
-	// building the SQLite database in memory, before switching to disk.
-	if s.StartupOnDisk || (!s.dbConf.Memory && !s.snapsExistOnOpen && s.lastCommandIdxOnOpen == 0) {
-		s.db, err = createOnDisk(nil, s.dbPath, s.dbConf.FKConstraints)
-		if err != nil {
-			return fmt.Errorf("failed to create on-disk database: %s", err)
-		}
-		s.onDiskCreated = true
-		s.logger.Printf("created on-disk database at open")
-	} else {
-		// We need an in-memory database, at least for bootstrapping purposes.
+	if s.dbConf.Memory {
 		s.db, err = createInMemory(nil, s.dbConf.FKConstraints)
 		if err != nil {
 			return fmt.Errorf("failed to create in-memory database: %s", err)
 		}
 		s.logger.Printf("created in-memory database at open")
+	} else {
+		s.db, err = createOnDisk(nil, s.dbPath, s.dbConf.FKConstraints, !s.dbConf.DisableWAL)
+		if err != nil {
+			return fmt.Errorf("failed to create on-disk database: %s", err)
+		}
+		s.onDiskCreated = true
+		s.logger.Printf("created on-disk database at open")
 	}
 
 	// Instantiate the Raft system.
@@ -453,6 +438,9 @@ func (s *Store) Open() (retErr error) {
 	// Register and listen for leader changes.
 	s.raft.RegisterObserver(s.observer)
 	s.observerClose, s.observerDone = s.observe()
+
+	// Periodically update the applied index for faster startup.
+	s.appliedIdxUpdateDone = s.updateAppliedIndex()
 
 	return nil
 }
@@ -532,6 +520,7 @@ func (s *Store) Close(wait bool) (retErr error) {
 		return nil
 	}
 
+	close(s.appliedIdxUpdateDone)
 	close(s.observerClose)
 	<-s.observerDone
 
@@ -547,6 +536,20 @@ func (s *Store) Close(wait bool) (retErr error) {
 	}
 	if err := s.boltStore.Close(); err != nil {
 		return err
+	}
+
+	// If in WAL mode, open-and-close again to remove the -wal file. This is not
+	// strictly necessary, since any on-disk database files will be removed when
+	// rqlite next starts, but it leaves the directory containing the database
+	// file in a cleaner state.
+	if !s.dbConf.Memory && !s.dbConf.DisableWAL {
+		walDB, err := sql.Open(s.dbPath, s.dbConf.FKConstraints, true)
+		if err != nil {
+			return err
+		}
+		if err := walDB.Close(); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -830,7 +833,8 @@ func (s *Store) Stats() (map[string]interface{}, error) {
 	}()
 	dbStatus, err := s.db.Stats()
 	if err != nil {
-		return nil, err
+		stats.Add(numDBStatsErrors, 1)
+		s.logger.Printf("failed to get database stats: %s", err.Error())
 	}
 
 	nodes, err := s.Nodes()
@@ -870,13 +874,18 @@ func (s *Store) Stats() (map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
+	lAppliedIdx, err := s.boltStore.GetAppliedIndex()
+	if err != nil {
+		return nil, err
+	}
 	status := map[string]interface{}{
-		"open":             s.open,
-		"node_id":          s.raftID,
-		"raft":             raftStats,
-		"fsm_index":        fsmIdx,
-		"db_applied_index": dbAppliedIdx,
-		"addr":             s.Addr(),
+		"open":               s.open,
+		"node_id":            s.raftID,
+		"raft":               raftStats,
+		"fsm_index":          fsmIdx,
+		"db_applied_index":   dbAppliedIdx,
+		"last_applied_index": lAppliedIdx,
+		"addr":               s.Addr(),
 		"leader": map[string]string{
 			"node_id": leaderID,
 			"addr":    leaderAddr,
@@ -886,7 +895,6 @@ func (s *Store) Stats() (map[string]interface{}, error) {
 			"observed": s.observer.GetNumObserved(),
 			"dropped":  s.observer.GetNumDropped(),
 		},
-		"startup_on_disk":        s.StartupOnDisk,
 		"apply_timeout":          s.ApplyTimeout.String(),
 		"heartbeat_timeout":      s.HeartbeatTimeout.String(),
 		"election_timeout":       s.ElectionTimeout.String(),
@@ -1378,11 +1386,15 @@ func (s *Store) setLogInfo() error {
 	if err != nil {
 		return fmt.Errorf("failed to get last index: %s", err)
 	}
+	s.lastAppliedIdxOnOpen, err = s.boltStore.GetAppliedIndex()
+	if err != nil {
+		return fmt.Errorf("failed to get last applied index: %s", err)
+	}
 	s.lastIdxOnOpen, err = s.boltStore.LastIndex()
 	if err != nil {
 		return fmt.Errorf("failed to get last index: %s", err)
 	}
-	s.lastCommandIdxOnOpen, err = s.boltStore.LastCommandIndex()
+	s.lastCommandIdxOnOpen, err = s.boltStore.LastCommandIndex(s.firstIdxOnOpen, s.lastAppliedIdxOnOpen)
 	if err != nil {
 		return fmt.Errorf("failed to get last command index: %s", err)
 	}
@@ -1423,6 +1435,31 @@ func (s *Store) raftConfig() *raft.Config {
 	return config
 }
 
+func (s *Store) updateAppliedIndex() chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(appliedIndexUpdateInterval)
+		defer ticker.Stop()
+		var idx uint64
+		for {
+			select {
+			case <-ticker.C:
+				newIdx := s.raft.AppliedIndex()
+				if newIdx == idx {
+					continue
+				}
+				idx = newIdx
+				if err := s.boltStore.SetAppliedIndex(idx); err != nil {
+					s.logger.Printf("failed to set applied index: %s", err.Error())
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+	return done
+}
+
 type fsmExecuteResponse struct {
 	results []*command.ExecuteResult
 	error   error
@@ -1454,38 +1491,8 @@ func (s *Store) Apply(l *raft.Log) (e interface{}) {
 			// opened.
 			s.appliedOnOpen++
 			if l.Index == s.lastCommandIdxOnOpen {
-				s.logger.Printf("%d committed log entries applied in %s, took %s since open",
+				s.logger.Printf("%d confirmed committed log entries applied in %s, took %s since open",
 					s.appliedOnOpen, time.Since(s.firstLogAppliedT), time.Since(s.openT))
-
-				// Last command log applied. Time to switch to on-disk database?
-				if s.dbConf.Memory {
-					s.logger.Println("continuing use of in-memory database")
-				} else if s.onDiskCreated {
-					s.logger.Println("continuing use of on-disk database")
-				} else {
-					// Since we're here, it means that a) an on-disk database was requested,
-					// b) in-memory creation of the on-disk database is enabled, and c) there
-					// were commands in the log. A snapshot may or may not have been applied,
-					// but it wouldn't have created the on-disk database in that case since
-					// there were commands in the log. This is the very last chance to convert
-					// from in-memory to on-disk.
-					s.queryTxMu.Lock()
-					defer s.queryTxMu.Unlock()
-					b, _ := s.db.Serialize()
-					err := s.db.Close()
-					if err != nil {
-						e = &fsmGenericResponse{error: fmt.Errorf("close failed: %s", err)}
-						return
-					}
-					// Open a new on-disk database.
-					s.db, err = createOnDisk(b, s.dbPath, s.dbConf.FKConstraints)
-					if err != nil {
-						e = &fsmGenericResponse{error: fmt.Errorf("open on-disk failed: %s", err)}
-						return
-					}
-					s.onDiskCreated = true
-					s.logger.Println("successfully switched to on-disk database")
-				}
 			}
 		}
 	}()
@@ -1546,8 +1553,7 @@ func (s *Store) Snapshot() (raft.FSMSnapshot, error) {
 
 // Restore restores the node to a previous state. The Hashicorp docs state this
 // will not be called concurrently with Apply(), so synchronization with Execute()
-// is not necessary. To prevent problems during queries, which may not go through
-// the log, it blocks all query requests.
+// is not necessary.
 func (s *Store) Restore(rc io.ReadCloser) error {
 	startT := time.Now()
 	b, err := dbBytesFromSnapshot(rc)
@@ -1563,33 +1569,24 @@ func (s *Store) Restore(rc io.ReadCloser) error {
 	}
 
 	var db *sql.DB
-	if s.StartupOnDisk || (!s.dbConf.Memory && s.lastCommandIdxOnOpen == 0) {
-		// A snapshot clearly exists (this function has been called) but there
-		// are no command entries in the log -- so Apply will not be called.
-		// Therefore, this is the last opportunity to create the on-disk database
-		// before Raft starts. This could also happen because the user has explicitly
-		// disabled the build-on-disk-database-in-memory-first optimization.
-		db, err = createOnDisk(b, s.dbPath, s.dbConf.FKConstraints)
+	if s.dbConf.Memory {
+		db, err = createInMemory(b, s.dbConf.FKConstraints)
+		if err != nil {
+			return fmt.Errorf("createInMemory: %s", err)
+		}
+	} else {
+		db, err = createOnDisk(b, s.dbPath, s.dbConf.FKConstraints, !s.dbConf.DisableWAL)
 		if err != nil {
 			return fmt.Errorf("open on-disk file during restore: %s", err)
 		}
 		s.onDiskCreated = true
 		s.logger.Println("successfully switched to on-disk database due to restore")
-	} else {
-		// Deserialize into an in-memory database because a) an in-memory database
-		// has been requested, or b) while there was a snapshot, there are also
-		// command entries in the log. So by sticking with an in-memory database
-		// those entries will be applied in the fastest possible manner. We will
-		// defer creation of any database on disk until the Apply function.
-		db, err = createInMemory(b, s.dbConf.FKConstraints)
-		if err != nil {
-			return fmt.Errorf("createInMemory: %s", err)
-		}
 	}
 	s.db = db
 
 	stats.Add(numRestores, 1)
 	s.logger.Printf("node restored in %s", time.Since(startT))
+	rc.Close()
 	return nil
 }
 
@@ -1751,7 +1748,7 @@ func (s *Store) tryCompress(rq command.Requester) ([]byte, bool, error) {
 // RecoverNode is used to manually force a new configuration, in the event that
 // quorum cannot be restored. This borrows heavily from RecoverCluster functionality
 // of the Hashicorp Raft library, but has been customized for rqlite use.
-func RecoverNode(dataDir string, logger *log.Logger, logs raft.LogStore, stable raft.StableStore,
+func RecoverNode(dataDir string, logger *log.Logger, logs raft.LogStore, stable *rlog.Log,
 	snaps raft.SnapshotStore, tn raft.Transport, conf raft.Configuration) error {
 	logPrefix := logger.Prefix()
 	logger.SetPrefix(fmt.Sprintf("%s[recovery] ", logPrefix))
@@ -1861,64 +1858,22 @@ func RecoverNode(dataDir string, logger *log.Logger, logs raft.LogStore, stable 
 		return fmt.Errorf("log compaction failed: %v", err)
 	}
 
+	// Erase record of previous updating of Applied Index too.
+	if err := stable.SetAppliedIndex(0); err != nil {
+		return fmt.Errorf("failed to zero applied index: %v", err)
+	}
+
 	return nil
 }
 
 func dbBytesFromSnapshot(rc io.ReadCloser) ([]byte, error) {
-	var uint64Size uint64
-	inc := int64(unsafe.Sizeof(uint64Size))
-
-	// Read all the data into RAM, since we have to decode known-length
-	// chunks of various forms.
-	var offset int64
-	b, err := ioutil.ReadAll(rc)
+	var database bytes.Buffer
+	decoder := snapshot.NewV1Decoder(rc)
+	_, err := decoder.WriteTo(&database)
 	if err != nil {
-		return nil, fmt.Errorf("readall: %s", err)
+		return nil, err
 	}
-
-	// Get size of database, checking for compression.
-	compressed := false
-	sz, err := readUint64(b[offset : offset+inc])
-	if err != nil {
-		return nil, fmt.Errorf("read compression check: %s", err)
-	}
-	offset = offset + inc
-
-	if sz == math.MaxUint64 {
-		compressed = true
-		// Database is actually compressed, read actual size next.
-		sz, err = readUint64(b[offset : offset+inc])
-		if err != nil {
-			return nil, fmt.Errorf("read compressed size: %s", err)
-		}
-		offset = offset + inc
-	}
-
-	// Now read in the database file data, decompress if necessary, and restore.
-	var database []byte
-	if sz > 0 {
-		if compressed {
-			buf := new(bytes.Buffer)
-			gz, err := gzip.NewReader(bytes.NewReader(b[offset : offset+int64(sz)]))
-			if err != nil {
-				return nil, err
-			}
-
-			if _, err := io.Copy(buf, gz); err != nil {
-				return nil, fmt.Errorf("SQLite database decompress: %s", err)
-			}
-
-			if err := gz.Close(); err != nil {
-				return nil, err
-			}
-			database = buf.Bytes()
-		} else {
-			database = b[offset : offset+int64(sz)]
-		}
-	} else {
-		database = nil
-	}
-	return database, nil
+	return database.Bytes(), nil
 }
 
 func applyCommand(data []byte, pDB **sql.DB) (command.Command_Type, interface{}) {
@@ -1965,7 +1920,7 @@ func applyCommand(data []byte, pDB **sql.DB) (command.Command_Type, interface{})
 				return c.Type, &fsmGenericResponse{error: fmt.Errorf("failed to create in-memory database: %s", err)}
 			}
 		} else {
-			newDB, err = createOnDisk(lr.Data, db.Path(), db.FKEnabled())
+			newDB, err = createOnDisk(lr.Data, db.Path(), db.FKEnabled(), db.WALEnabled())
 			if err != nil {
 				return c.Type, &fsmGenericResponse{error: fmt.Errorf("failed to create on-disk database: %s", err)}
 			}
@@ -2036,8 +1991,8 @@ func createInMemory(b []byte, fkConstraints bool) (db *sql.DB, err error) {
 // createOnDisk opens an on-disk database file at the configured path. If b is
 // non-nil, any preexisting file will first be overwritten with those contents.
 // Otherwise, any preexisting file will be removed before the database is opened.
-func createOnDisk(b []byte, path string, fkConstraints bool) (*sql.DB, error) {
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+func createOnDisk(b []byte, path string, fkConstraints, wal bool) (*sql.DB, error) {
+	if err := sql.RemoveFiles(path); err != nil {
 		return nil, err
 	}
 	if b != nil {
@@ -2045,19 +2000,7 @@ func createOnDisk(b []byte, path string, fkConstraints bool) (*sql.DB, error) {
 			return nil, err
 		}
 	}
-	return sql.Open(path, fkConstraints)
-}
-
-func readUint64(b []byte) (uint64, error) {
-	var sz uint64
-	if err := binary.Read(bytes.NewReader(b), binary.LittleEndian, &sz); err != nil {
-		return 0, err
-	}
-	return sz, nil
-}
-
-func writeUint64(w io.Writer, v uint64) error {
-	return binary.Write(w, binary.LittleEndian, v)
+	return sql.Open(path, fkConstraints, wal)
 }
 
 // enabledFromBool converts bool to "enabled" or "disabled".

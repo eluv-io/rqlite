@@ -1,5 +1,50 @@
+## 7.21.4 (July 8th 2023)
+### Implementation changes and bug fixes
+- [PR #1336](https://github.com/rqlite/rqlite/pull/1336): Remove on-disk-startup control. It's no longer needed as on-disk performance is now very close to in-memory performance, thanks to the switch to _synchronous off_ mode and the use of the SQLite WAL.
+
+## 7.21.3 (July 7th 2023)
+### Implementation changes and bug fixes
+- [PR #1329](https://github.com/rqlite/rqlite/pull/1329): Try a different version of V2 Snapshot codec.
+- [PR #1332](https://github.com/rqlite/rqlite/pull/1332): Upgrade dependencies.
+- [PR #1333](https://github.com/rqlite/rqlite/pull/1333): Set "types" for expressions e.g. `COUNT`. Fixes [issue #1330](https://github.com/rqlite/rqlite/issues/1330)
+
+## 7.21.2 (July 1st 2023)
+### Implementation changes and bug fixes
+- [PR #1321](https://github.com/rqlite/rqlite/pull/1321): Check for errors in responses during load testing.
+- [PR #1323](https://github.com/rqlite/rqlite/pull/1323): Add codec for v2 snapshots.
+- [PR #1324](https://github.com/rqlite/rqlite/pull/1324): Close Snapshot after we're finished restoring from it.
+- [PR #1325](https://github.com/rqlite/rqlite/pull/1325): Handle getting an error when asking for database stats.
+
+## 7.21.1 (June 26th 2023)
+This release changes the mode of SQLite, when rqlite is running in _on-disk_ mode. SQLite now runs in WAL mode, when previously it was in DELETE mode. Testing shows this results in a ~30% increase in write-performance.
+
+### Implementation changes and bug fixes
+- [PR #1314](https://github.com/rqlite/rqlite/pull/1314): More preparations for WAL mode when running on-disk.
+- [PR #1315](https://github.com/rqlite/rqlite/pull/1315), [PR #1316](https://github.com/rqlite/rqlite/pull/1316): Enable WAL when running in on-disk mode.
+- [PR #1317](https://github.com/rqlite/rqlite/pull/1317): DB-layer now supports WAL replay.
+- [PR #1318](https://github.com/rqlite/rqlite/pull/1318): Periodically record actual applied index. Addresses a possible edge case with on-disk startup.
+  
+## 7.21.0 (June 20th 2023)
+### New features
+- [PR #1311](https://github.com/rqlite/rqlite/pull/1311): Support 'key' param on the `/status` HTTP endpoint.
+- [PR #1313](https://github.com/rqlite/rqlite/pull/1313): Sysdump now retrieves data from all nodes if possible.
+
+### Implementation changes and bug fixes
+- [PR #1309](https://github.com/rqlite/rqlite/pull/1309): Factor Snapshot creation into own module.
+
+## 7.20.6 (June 16th 2023)
+### Implementation changes and bug fixes
+- [PR #1305](https://github.com/rqlite/rqlite/pull/1305): Upgrade dependencies via `go get`.
+- [PR #1306](https://github.com/rqlite/rqlite/pull/1306): Add some (currently unused) WAL control code.
+- [PR #1307](https://github.com/rqlite/rqlite/pull/1307), [PR #1308](https://github.com/rqlite/rqlite/pull/1308): Add full WAL-support to database layer. Not yet enabled by full application.
+
+## 7.20.5 (June 14th 2023)
+### Implementation changes and bug fixes
+- [PR #1302](https://github.com/rqlite/rqlite/pull/1302): Add some important PRAGMA state to database-level status reporting.
+- [PR #1303](https://github.com/rqlite/rqlite/pull/1303): Reduce disk space usage by retaining only a single Raft SQLite snapshot.
+
 ## 7.20.4 (June 13th 2023)
-This release changes the "syncing" mode SQLite uses when rqlite runs in "on-disk" mode. It does this by switching "synchronous" to OFF. The [SQLite docs](https://www.sqlite.org/pragma.html#pragma_synchronous) state that this risks database corruption in the event of a crash, but that's OK, as rqlite always blows away any SQLite database on startup and rebuilds it from the Raft log. Testing should this results in (at least) a 3x speed-up in write performance.
+This release changes the "syncing" mode SQLite uses to _OFF_ when rqlite runs in "on-disk" mode. The [SQLite docs](https://www.sqlite.org/pragma.html#pragma_synchronous) state that this risks database corruption in the event of a crash, but that's a non-issue for rqlite, as rqlite always deletes any SQLite database on startup and rebuilds it from the Raft log. Testing shows this change results in (at least) a 3x speed-up in write performance when operating in "on-disk" mode.
 
 ### Implementation changes and bug fixes
 - [PR #1301](https://github.com/rqlite/rqlite/pull/1301): Set sychronous mode to `OFF` for SQLite on-disk files.
