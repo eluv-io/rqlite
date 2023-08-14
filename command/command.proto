@@ -17,6 +17,7 @@ message Parameter {
 message Statement {
 	string sql = 1;
 	repeated Parameter parameters = 2;
+	bool returning = 3;
 }
 
 message Request {
@@ -60,6 +61,21 @@ message ExecuteResult {
 	double time = 4;
 }
 
+message ExecuteQueryRequest {
+	Request request = 1;
+	bool timings = 2;
+	QueryRequest.Level level = 3;
+	int64 freshness = 4;
+}
+
+message ExecuteQueryResponse {
+	oneof result {
+		QueryRows q = 1;
+		ExecuteResult e = 2;
+		string error = 3;
+	}
+}
+
 message BackupRequest {
 	enum Format {
 		BACKUP_REQUEST_FORMAT_NONE = 0;
@@ -72,6 +88,17 @@ message BackupRequest {
 
 message LoadRequest {
 	bytes data = 1;
+}
+
+message JoinRequest {
+	string id = 1;
+	string address = 2;
+	bool voter = 3;
+}
+
+message NotifyRequest {
+	string id = 1;
+	string address = 2;
 }
 
 message RemoveNodeRequest {
@@ -89,6 +116,8 @@ message Command {
         COMMAND_TYPE_EXECUTE = 2;
         COMMAND_TYPE_NOOP = 3;
         COMMAND_TYPE_LOAD = 4;
+        COMMAND_TYPE_JOIN = 5;
+		COMMAND_TYPE_EXECUTE_QUERY = 6;
     }
     Type type = 1;
     bytes sub_command = 2;

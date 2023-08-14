@@ -5,7 +5,6 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
-	"io/ioutil"
 	golog "log"
 	"net"
 	"os"
@@ -18,6 +17,7 @@ import (
 	"github.com/rqlite/rqlite-disco-clients/dns"
 	"github.com/rqlite/rqlite-disco-clients/dnssrv"
 	"github.com/rqlite/rqlite-disco-clients/etcd"
+	"github.com/rqlite/rqlite/v7/rtls"
 
 	"github.com/rqlite/rqlite/v7/auth"
 	"github.com/rqlite/rqlite/v7/cluster"
@@ -128,7 +128,15 @@ func New(config Config) (*Embedded, error) {
 	log.Printf("cluster TCP mux Listener registered with %d", cluster.MuxClusterHeader)
 
 	// Start the HTTP API server.
-	clstrDialer := tcp.NewDialer(cluster.MuxClusterHeader, cfg.NodeEncrypt, cfg.NoNodeVerify)
+	var dialerTLSConfig *tls.Config
+	if cfg.NodeX509Cert != "" || cfg.NodeX509CACert != "" {
+		dialerTLSConfig, err = rtls.CreateClientConfig(cfg.NodeX509Cert, cfg.NodeX509Key,
+			cfg.NodeX509CACert, cfg.NoNodeVerify, cfg.TLS1011)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create TLS config for cluster dialer: %s", err.Error())
+		}
+	}
+	clstrDialer := tcp.NewDialer(cluster.MuxClusterHeader, dialerTLSConfig)
 	clstrClient := cluster.NewClient(clstrDialer, cfg.ClusterConnectTimeout)
 	if err = clstrClient.SetLocal(cfg.RaftAdv, emb.cluster); err != nil {
 		return nil, errors.WithMessage(err, "set cluster client local parameters")
@@ -148,15 +156,15 @@ func New(config Config) (*Embedded, error) {
 	_ = emb.httpdService.RegisterStatus("cluster", emb.cluster)
 
 	tlsConfig := tls.Config{InsecureSkipVerify: cfg.NoHTTPVerify}
-	if cfg.X509CACert != "" {
-		asn1Data, err := ioutil.ReadFile(cfg.X509CACert)
+	if cfg.HTTPx509CACert != "" {
+		asn1Data, err := os.ReadFile(cfg.HTTPx509CACert)
 		if err != nil {
-			return nil, errors.WithMessagef(err, "reading ca cert [%s]", cfg.X509CACert)
+			return nil, errors.WithMessagef(err, "reading ca cert [%s]", cfg.HTTPx509CACert)
 		}
 		tlsConfig.RootCAs = x509.NewCertPool()
 		ok := tlsConfig.RootCAs.AppendCertsFromPEM(asn1Data)
 		if !ok {
-			return nil, fmt.Errorf("failed to parse root CA certificate(s) in %q", cfg.X509CACert)
+			return nil, fmt.Errorf("failed to parse root CA certificate(s) in %q", cfg.HTTPx509CACert)
 		}
 	}
 
@@ -181,6 +189,7 @@ func createStore(cfg *Config, ln *tcp.Layer) (*store.Store, error) {
 	dbConf := store.NewDBConfig(!cfg.OnDisk)
 	dbConf.OnDiskPath = cfg.OnDiskPath
 	dbConf.FKConstraints = cfg.FKConstraints
+	dbConf.DisableWAL = cfg.DisableWAL
 
 	str := store.New(ln, &store.Config{
 		DBConf: dbConf,
@@ -190,7 +199,6 @@ func createStore(cfg *Config, ln *tcp.Layer) (*store.Store, error) {
 	})
 
 	// Set optional parameters on store.
-	str.StartupOnDisk = cfg.OnDiskStartup
 	str.SetRequestCompression(cfg.CompressionBatch, cfg.CompressionSize)
 	str.RaftLogLevel = cfg.RaftLogLevel
 	str.RaftLogger = cfg.HcLogger
@@ -266,8 +274,8 @@ func startHTTPService(cfg *Config, str *store.Store, cltr *cluster.Client, credS
 	}
 
 	adaptLogger(cfg, s.Logger())
-	s.CertFile = cfg.X509Cert
-	s.KeyFile = cfg.X509Key
+	s.CertFile = cfg.HTTPx509Cert
+	s.KeyFile = cfg.HTTPx509Key
 	s.TLS1011 = cfg.TLS1011
 	s.Expvar = cfg.Expvar
 	s.Pprof = cfg.PprofEnabled
@@ -296,7 +304,7 @@ func startNodeMux(cfg *Config, ln net.Listener) (*tcp.Mux, error) {
 	var mux *tcp.Mux
 	if cfg.NodeEncrypt {
 		log.Printf("enabling node-to-node encryption with cert: %s, key: %s", cfg.NodeX509Cert, cfg.NodeX509Key)
-		mux, err = tcp.NewTLSMux(ln, adv, cfg.NodeX509Cert, cfg.NodeX509Key, cfg.NodeX509CACert)
+		mux, err = tcp.NewTLSMux(ln, adv, cfg.NodeX509Cert, cfg.NodeX509Key, cfg.NodeX509CACert, cfg.NoNodeVerify, cfg.NodeVerifyClient)
 	} else {
 		mux, err = tcp.NewMux(ln, adv)
 	}
@@ -304,7 +312,6 @@ func startNodeMux(cfg *Config, ln net.Listener) (*tcp.Mux, error) {
 		return nil, fmt.Errorf("failed to create node-to-node mux: %s", err.Error())
 	}
 	adaptLogger(cfg, mux.Logger)
-	mux.InsecureSkipVerify = cfg.NoNodeVerify
 	go mux.Serve()
 
 	return mux, nil
@@ -339,7 +346,7 @@ func clusterService(cfg *Config, tn cluster.Transport, db cluster.Database, mgr 
 	c := cluster.New(tn, db, mgr, credStr)
 	adaptLogger(cfg, c.Logger())
 	c.SetAPIAddr(cfg.HTTPAdv)
-	c.EnableHTTPS(cfg.X509Cert != "" && cfg.X509Key != "") // Conditions met for an HTTPS API
+	c.EnableHTTPS(cfg.HTTPx509Cert != "" && cfg.HTTPx509Key != "") // Conditions met for an HTTPS API
 
 	if err := c.Open(); err != nil {
 		return nil, err

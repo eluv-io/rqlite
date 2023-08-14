@@ -5,33 +5,38 @@ package store
 
 import (
 	"bytes"
-	"compress/gzip"
-	"encoding/binary"
 	"errors"
 	"expvar"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
-	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"github.com/rqlite/rqlite/v7/command"
 	sql "github.com/rqlite/rqlite/v7/db"
 	rlog "github.com/rqlite/rqlite/v7/log"
+	"github.com/rqlite/rqlite/v7/snapshot"
 )
 
 var (
 	// ErrNotOpen is returned when a Store is not open.
 	ErrNotOpen = errors.New("store not open")
+
+	// ErrOpen is returned when a Store is already open.
+	ErrOpen = errors.New("store already open")
+
+	// ErrNotReady is returned when a Store is not ready to accept requests.
+	ErrNotReady = errors.New("store not ready")
 
 	// ErrNotLeader is returned when a node attempts to execute a leader-only
 	// operation.
@@ -45,39 +50,53 @@ var (
 	// logs within the specified time.
 	ErrOpenTimeout = errors.New("timeout waiting for initial logs application")
 
+	// ErrWaitForRemovalTimeout is returned when the Store does not confirm removal
+	// of a node within the specified time.
+	ErrWaitForRemovalTimeout = errors.New("timeout waiting for node removal confirmation")
+
+	// ErrWaitForLeaderTimeout is returned when the Store cannot determine the leader
+	// within the specified time.
+	ErrWaitForLeaderTimeout = errors.New("timeout waiting for leader")
+
 	// ErrInvalidBackupFormat is returned when the requested backup format
 	// is not valid.
 	ErrInvalidBackupFormat = errors.New("invalid backup format")
 )
 
 const (
-	raftDBPath          = "raft.db" // Changing this will break backwards compatibility.
-	peersPath           = "raft/peers.json"
-	peersInfoPath       = "raft/peers.info"
-	retainSnapshotCount = 2
-	applyTimeout        = 10 * time.Second
-	openTimeout         = 120 * time.Second
-	sqliteFile          = "db.sqlite"
-	leaderWaitDelay     = 100 * time.Millisecond
-	appliedWaitDelay    = 100 * time.Millisecond
-	connectionPoolCount = 5
-	connectionTimeout   = 10 * time.Second
-	raftLogCacheSize    = 512
-	trailingScale       = 1.25
-	observerChanLen     = 50
+	raftDBPath                 = "raft.db" // Changing this will break backwards compatibility.
+	peersPath                  = "raft/peers.json"
+	peersInfoPath              = "raft/peers.info"
+	retainSnapshotCount        = 1
+	applyTimeout               = 10 * time.Second
+	openTimeout                = 120 * time.Second
+	sqliteFile                 = "db.sqlite"
+	leaderWaitDelay            = 100 * time.Millisecond
+	appliedWaitDelay           = 100 * time.Millisecond
+	appliedIndexUpdateInterval = 5 * time.Second
+	connectionPoolCount        = 5
+	connectionTimeout          = 10 * time.Second
+	raftLogCacheSize           = 512
+	trailingScale              = 1.25
+	observerChanLen            = 50
 )
 
 const (
 	numSnaphots              = "num_snapshots"
+	numProvides              = "num_provides"
 	numBackups               = "num_backups"
 	numLoads                 = "num_loads"
 	numRestores              = "num_restores"
+	numAutoRestores          = "num_auto_restores"
+	numAutoRestoresSkipped   = "num_auto_restores_skipped"
+	numAutoRestoresFailed    = "num_auto_restores_failed"
 	numRecoveries            = "num_recoveries"
 	numUncompressedCommands  = "num_uncompressed_commands"
 	numCompressedCommands    = "num_compressed_commands"
 	numJoins                 = "num_joins"
 	numIgnoredJoins          = "num_ignored_joins"
 	numRemovedBeforeJoins    = "num_removed_before_joins"
+	numDBStatsErrors         = "num_db_stats_errors"
 	snapshotCreateDuration   = "snapshot_create_duration"
 	snapshotPersistDuration  = "snapshot_persist_duration"
 	snapshotDBSerializedSize = "snapshot_db_serialized_size"
@@ -99,15 +118,21 @@ func init() {
 
 // ResetStats resets the expvar stats for this module. Mostly for test purposes.
 func ResetStats() {
+	stats.Init()
 	stats.Add(numSnaphots, 0)
+	stats.Add(numProvides, 0)
 	stats.Add(numBackups, 0)
 	stats.Add(numRestores, 0)
 	stats.Add(numRecoveries, 0)
+	stats.Add(numAutoRestores, 0)
+	stats.Add(numAutoRestoresSkipped, 0)
+	stats.Add(numAutoRestoresFailed, 0)
 	stats.Add(numUncompressedCommands, 0)
 	stats.Add(numCompressedCommands, 0)
 	stats.Add(numJoins, 0)
 	stats.Add(numIgnoredJoins, 0)
 	stats.Add(numRemovedBeforeJoins, 0)
+	stats.Add(numDBStatsErrors, 0)
 	stats.Add(snapshotCreateDuration, 0)
 	stats.Add(snapshotPersistDuration, 0)
 	stats.Add(snapshotDBSerializedSize, 0)
@@ -138,6 +163,9 @@ type Store struct {
 	peersPath     string
 	peersInfoPath string
 
+	restorePath   string
+	restoreDoneCh chan struct{}
+
 	raft   *raft.Raft // The consensus mechanism.
 	ln     Listener
 	raftTn *raft.NetworkTransport
@@ -148,8 +176,14 @@ type Store struct {
 
 	queryTxMu sync.RWMutex
 
-	dbAppliedIndexMu sync.RWMutex
-	dbAppliedIndex   uint64
+	dbAppliedIndexMu     sync.RWMutex
+	dbAppliedIndex       uint64
+	appliedIdxUpdateDone chan struct{}
+
+	// Channels that must be closed for the Store to be considered ready.
+	readyChans             []<-chan struct{}
+	numClosedReadyChannels int
+	readyChansMu           sync.Mutex
 
 	// Latest log entry index actually reflected by the FSM. Due to Raft code
 	// this value is not updated after a Snapshot-restore.
@@ -168,13 +202,12 @@ type Store struct {
 	observerDone      chan struct{}
 	observerChan      chan raft.Observation
 	observer          *raft.Observer
-	observerWg        sync.WaitGroup
 
 	onDiskCreated        bool      // On disk database actually created?
-	snapsExistOnOpen     bool      // Any snaps present when store opens?
 	firstIdxOnOpen       uint64    // First index on log when Store opens.
 	lastIdxOnOpen        uint64    // Last index on log when Store opens.
-	lastCommandIdxOnOpen uint64    // Last command index on log when Store opens.
+	lastCommandIdxOnOpen uint64    // Last command index before applied index when Store opens.
+	lastAppliedIdxOnOpen uint64    // Last applied index on log when Store opens.
 	firstLogAppliedT     time.Time // Time first log is applied
 	appliedOnOpen        uint64    // Number of logs applied at open.
 	openT                time.Time // Timestamp when Store opens.
@@ -185,14 +218,6 @@ type Store struct {
 	BootstrapExpect int
 	bootstrapped    bool
 	notifyingNodes  map[string]*Server
-
-	// StartupOnDisk disables in-memory initialization of on-disk databases.
-	// Restarting a node with an on-disk database can be slow so, by default,
-	// rqlite creates on-disk databases in memory first, and then moves the
-	// database to disk before Raft starts. However, this optimization can
-	// prevent nodes with very large (2GB+) databases from starting. This
-	// flag allows control of the optimization.
-	StartupOnDisk bool
 
 	ShutdownOnRemove   bool
 	SnapshotThreshold  uint64
@@ -252,6 +277,7 @@ func New(ln Listener, c *Config) *Store {
 		raftDir:         c.Dir,
 		peersPath:       filepath.Join(c.Dir, peersPath),
 		peersInfoPath:   filepath.Join(c.Dir, peersInfoPath),
+		restoreDoneCh:   make(chan struct{}),
 		raftID:          c.ID,
 		dbConf:          c.DBConf,
 		dbPath:          dbPath,
@@ -263,6 +289,31 @@ func New(ln Listener, c *Config) *Store {
 	}
 }
 
+// SetRestorePath sets the path to a file containing a copy of a
+// SQLite database. This database will be loaded if and when the
+// node becomes the Leader for the first time only. The Store will
+// also delete the file when it's finished with it.
+//
+// This function should only be called before the Store is opened
+// and setting the restore path means the Store will not report
+// itself as ready until a restore has been attempted.
+func (s *Store) SetRestorePath(path string) error {
+	if s.open {
+		return ErrOpen
+	}
+
+	if !sql.IsValidSQLiteFile(path) {
+		return fmt.Errorf("file %s is not a valid SQLite file", path)
+	}
+	if sql.IsWALModeEnabledSQLiteFile(path) {
+		return fmt.Errorf("file %s is in WAL mode - convert to DELETE mode", path)
+	}
+
+	s.RegisterReadyChannel(s.restoreDoneCh)
+	s.restorePath = path
+	return nil
+}
+
 // Open opens the Store.
 func (s *Store) Open() (retErr error) {
 	defer func() {
@@ -272,23 +323,22 @@ func (s *Store) Open() (retErr error) {
 	}()
 
 	if s.open {
-		return fmt.Errorf("store already open")
+		return ErrOpen
 	}
 
 	s.openT = time.Now()
 	s.logger.Printf("opening store with node ID %s", s.raftID)
 
-	if !s.dbConf.Memory {
+	if s.dbConf.Memory {
+		s.logger.Printf("configured for an in-memory database")
+	} else {
 		s.logger.Printf("configured for an on-disk database at %s", s.dbPath)
-		s.logger.Printf("on-disk database in-memory creation %s", enabledFromBool(!s.StartupOnDisk))
 		parentDir := filepath.Dir(s.dbPath)
 		s.logger.Printf("ensuring directory for on-disk database exists at %s", parentDir)
 		err := os.MkdirAll(parentDir, 0755)
 		if err != nil {
 			return err
 		}
-	} else {
-		s.logger.Printf("configured for an in-memory database")
 	}
 
 	// Create all the required Raft directories.
@@ -319,7 +369,6 @@ func (s *Store) Open() (retErr error) {
 		return fmt.Errorf("list snapshots: %s", err)
 	}
 	s.logger.Printf("%d preexisting snapshots present", len(snaps))
-	s.snapsExistOnOpen = len(snaps) > 0
 
 	// Create the log store and stable store.
 	s.boltStore, err = rlog.New(filepath.Join(s.raftDir, raftDBPath), s.NoFreeListSync)
@@ -339,7 +388,7 @@ func (s *Store) Open() (retErr error) {
 		if err != nil {
 			return fmt.Errorf("failed to read peers file: %s", err.Error())
 		}
-		if err = RecoverNode(s.raftDir, s.logger, s.raftLog, s.raftStable, snapshots, s.raftTn, config); err != nil {
+		if err = RecoverNode(s.raftDir, s.logger, s.raftLog, s.boltStore, snapshots, s.raftTn, config); err != nil {
 			return fmt.Errorf("failed to recover node: %s", err.Error())
 		}
 		if err := os.Rename(s.peersPath, s.peersInfoPath); err != nil {
@@ -353,28 +402,22 @@ func (s *Store) Open() (retErr error) {
 	if err := s.setLogInfo(); err != nil {
 		return fmt.Errorf("set log info: %s", err)
 	}
-	s.logger.Printf("first log index: %d, last log index: %d, last command log index: %d:",
-		s.firstIdxOnOpen, s.lastIdxOnOpen, s.lastCommandIdxOnOpen)
+	s.logger.Printf("first log index: %d, last log index: %d, last applied index: %d, last command log index: %d:",
+		s.firstIdxOnOpen, s.lastIdxOnOpen, s.lastAppliedIdxOnOpen, s.lastCommandIdxOnOpen)
 
-	// If an on-disk database has been requested, and there are no snapshots, and
-	// there are no commands in the log, then this is the only opportunity to
-	// create that on-disk database file before Raft initializes. In addition, this
-	// can also happen if the user explicitly disables the startup optimization of
-	// building the SQLite database in memory, before switching to disk.
-	if s.StartupOnDisk || (!s.dbConf.Memory && !s.snapsExistOnOpen && s.lastCommandIdxOnOpen == 0) {
-		s.db, err = createOnDisk(nil, s.dbPath, s.dbConf.FKConstraints)
+	if s.dbConf.Memory {
+		s.db, err = createInMemory(nil, s.dbConf.FKConstraints)
 		if err != nil {
-			return fmt.Errorf("failed to create on-disk database")
+			return fmt.Errorf("failed to create in-memory database: %s", err)
+		}
+		s.logger.Printf("created in-memory database at open")
+	} else {
+		s.db, err = createOnDisk(nil, s.dbPath, s.dbConf.FKConstraints, !s.dbConf.DisableWAL)
+		if err != nil {
+			return fmt.Errorf("failed to create on-disk database: %s", err)
 		}
 		s.onDiskCreated = true
 		s.logger.Printf("created on-disk database at open")
-	} else {
-		// We need an in-memory database, at least for bootstrapping purposes.
-		s.db, err = createInMemory(nil, s.dbConf.FKConstraints)
-		if err != nil {
-			return fmt.Errorf("failed to create in-memory database")
-		}
-		s.logger.Printf("created in-memory database at open")
 	}
 
 	// Instantiate the Raft system.
@@ -395,6 +438,9 @@ func (s *Store) Open() (retErr error) {
 	// Register and listen for leader changes.
 	s.raft.RegisterObserver(s.observer)
 	s.observerClose, s.observerDone = s.observe()
+
+	// Periodically update the applied index for faster startup.
+	s.appliedIdxUpdateDone = s.updateAppliedIndex()
 
 	return nil
 }
@@ -424,7 +470,42 @@ func (s *Store) Stepdown(wait bool) error {
 	if !wait {
 		return nil
 	}
-	return f.(raft.Future).Error()
+	return f.Error()
+}
+
+// RegisterReadyChannel registers a channel that must be closed before the
+// store is considered "ready" to serve requests.
+func (s *Store) RegisterReadyChannel(ch <-chan struct{}) {
+	s.readyChansMu.Lock()
+	defer s.readyChansMu.Unlock()
+	s.readyChans = append(s.readyChans, ch)
+	go func() {
+		<-ch
+		s.readyChansMu.Lock()
+		s.numClosedReadyChannels++
+		s.readyChansMu.Unlock()
+	}()
+}
+
+// Ready returns true if the store is ready to serve requests. Ready is
+// defined as having no open channels registered via RegisterReadyChannel
+// and having a Leader.
+func (s *Store) Ready() bool {
+	l, err := s.LeaderAddr()
+	if err != nil || l == "" {
+		return false
+	}
+
+	return func() bool {
+		s.readyChansMu.Lock()
+		defer s.readyChansMu.Unlock()
+		if s.numClosedReadyChannels != len(s.readyChans) {
+			return false
+		}
+		s.readyChans = nil
+		s.numClosedReadyChannels = 0
+		return true
+	}()
 }
 
 // Close closes the store. If wait is true, waits for a graceful shutdown.
@@ -439,13 +520,14 @@ func (s *Store) Close(wait bool) (retErr error) {
 		return nil
 	}
 
+	close(s.appliedIdxUpdateDone)
 	close(s.observerClose)
 	<-s.observerDone
 
 	f := s.raft.Shutdown()
 	if wait {
-		if e := f.(raft.Future); e.Error() != nil {
-			return e.Error()
+		if f.Error() != nil {
+			return f.Error()
 		}
 	}
 	// Only shutdown Bolt and SQLite when Raft is done.
@@ -454,6 +536,20 @@ func (s *Store) Close(wait bool) (retErr error) {
 	}
 	if err := s.boltStore.Close(); err != nil {
 		return err
+	}
+
+	// If in WAL mode, open-and-close again to remove the -wal file. This is not
+	// strictly necessary, since any on-disk database files will be removed when
+	// rqlite next starts, but it leaves the directory containing the database
+	// file in a cleaner state.
+	if !s.dbConf.Memory && !s.dbConf.DisableWAL {
+		walDB, err := sql.Open(s.dbPath, s.dbConf.FKConstraints, true)
+		if err != nil {
+			return err
+		}
+		if err := walDB.Close(); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -513,6 +609,22 @@ func (s *Store) IsLeader() bool {
 	return s.raft.State() == raft.Leader
 }
 
+// IsVoter returns true if the current node is a voter in the cluster. If there
+// is no reference to the current node in the current cluster configuration then
+// false will also be returned.
+func (s *Store) IsVoter() (bool, error) {
+	cfg := s.raft.GetConfiguration()
+	if err := cfg.Error(); err != nil {
+		return false, err
+	}
+	for _, srv := range cfg.Configuration().Servers {
+		if srv.ID == raft.ServerID(s.raftID) {
+			return srv.Suffrage == raft.Voter, nil
+		}
+	}
+	return false, nil
+}
+
 // State returns the current node's Raft state
 func (s *Store) State() ClusterState {
 	state := s.raft.State()
@@ -551,8 +663,8 @@ func (s *Store) LeaderAddr() (string, error) {
 	if !s.open {
 		return "", nil
 	}
-
-	return string(s.raft.Leader()), nil
+	addr, _ := s.raft.LeaderWithID()
+	return string(addr), nil
 }
 
 // LeaderID returns the node ID of the Raft leader. Returns a
@@ -601,25 +713,71 @@ func (s *Store) Nodes() ([]*Server, error) {
 	return servers, nil
 }
 
+// WaitForRemoval blocks until a node with the given ID is removed from the
+// cluster or the timeout expires.
+func (s *Store) WaitForRemoval(id string, timeout time.Duration) error {
+	check := func() bool {
+		nodes, err := s.Nodes()
+		if err == nil && !Servers(nodes).Contains(id) {
+			return true
+		}
+		return false
+	}
+
+	// try the fast path
+	if check() {
+		return nil
+	}
+
+	tck := time.NewTicker(appliedWaitDelay)
+	defer tck.Stop()
+	tmr := time.NewTimer(timeout)
+	defer tmr.Stop()
+	for {
+		select {
+		case <-tck.C:
+			if check() {
+				return nil
+			}
+		case <-tmr.C:
+			return ErrWaitForRemovalTimeout
+		}
+	}
+}
+
 // WaitForLeader blocks until a leader is detected, or the timeout expires.
 func (s *Store) WaitForLeader(timeout time.Duration) (string, error) {
+	var err error
+	var leaderAddr string
+
+	check := func() bool {
+		leaderAddr, err = s.LeaderAddr()
+		if err == nil && leaderAddr != "" {
+			return true
+		}
+		return false
+	}
+
+	// try the fast path
+	if check() {
+		return leaderAddr, nil
+	}
+
 	tck := time.NewTicker(leaderWaitDelay)
 	defer tck.Stop()
 	tmr := time.NewTimer(timeout)
 	defer tmr.Stop()
-
 	for {
 		select {
 		case <-tck.C:
-			l, err := s.LeaderAddr()
-			if err != nil {
-				return "", nil
-			}
-			if l != "" {
-				return l, nil
+			if check() {
+				return leaderAddr, nil
 			}
 		case <-tmr.C:
-			return "", fmt.Errorf("timeout expired")
+			if err != nil {
+				s.logger.Printf("timed out waiting for leader, last error: %s", err.Error())
+			}
+			return "", ErrWaitForLeaderTimeout
 		}
 	}
 }
@@ -675,7 +833,8 @@ func (s *Store) Stats() (map[string]interface{}, error) {
 	}()
 	dbStatus, err := s.db.Stats()
 	if err != nil {
-		return nil, err
+		stats.Add(numDBStatsErrors, 1)
+		s.logger.Printf("failed to get database stats: %s", err.Error())
 	}
 
 	nodes, err := s.Nodes()
@@ -700,6 +859,10 @@ func (s *Store) Stats() (map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
+	raftStats["voter"], err = s.IsVoter()
+	if err != nil {
+		return nil, err
+	}
 	raftStats["bolt"] = s.boltStore.Stats()
 
 	dirSz, err := dirSize(s.raftDir)
@@ -711,22 +874,27 @@ func (s *Store) Stats() (map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
+	lAppliedIdx, err := s.boltStore.GetAppliedIndex()
+	if err != nil {
+		return nil, err
+	}
 	status := map[string]interface{}{
-		"open":             s.open,
-		"node_id":          s.raftID,
-		"raft":             raftStats,
-		"fsm_index":        fsmIdx,
-		"db_applied_index": dbAppliedIdx,
-		"addr":             s.Addr(),
+		"open":               s.open,
+		"node_id":            s.raftID,
+		"raft":               raftStats,
+		"fsm_index":          fsmIdx,
+		"db_applied_index":   dbAppliedIdx,
+		"last_applied_index": lAppliedIdx,
+		"addr":               s.Addr(),
 		"leader": map[string]string{
 			"node_id": leaderID,
 			"addr":    leaderAddr,
 		},
+		"ready": s.Ready(),
 		"observer": map[string]uint64{
 			"observed": s.observer.GetNumObserved(),
 			"dropped":  s.observer.GetNumDropped(),
 		},
-		"startup_on_disk":        s.StartupOnDisk,
 		"apply_timeout":          s.ApplyTimeout.String(),
 		"heartbeat_timeout":      s.HeartbeatTimeout.String(),
 		"election_timeout":       s.ElectionTimeout.String(),
@@ -755,18 +923,17 @@ func (s *Store) Execute(ex *command.ExecuteRequest) ([]*command.ExecuteResult, e
 	if s.raft.State() != raft.Leader {
 		return nil, ErrNotLeader
 	}
+	if !s.Ready() {
+		return nil, ErrNotReady
+	}
+
 	return s.execute(ex)
 }
 
 func (s *Store) execute(ex *command.ExecuteRequest) ([]*command.ExecuteResult, error) {
-	b, compressed, err := s.reqMarshaller.Marshal(ex)
+	b, compressed, err := s.tryCompress(ex)
 	if err != nil {
 		return nil, err
-	}
-	if compressed {
-		stats.Add(numCompressedCommands, 1)
-	} else {
-		stats.Add(numUncompressedCommands, 1)
 	}
 
 	c := &command.Command{
@@ -780,7 +947,7 @@ func (s *Store) execute(ex *command.ExecuteRequest) ([]*command.ExecuteResult, e
 		return nil, err
 	}
 
-	af := s.raft.Apply(b, s.ApplyTimeout).(raft.ApplyFuture)
+	af := s.raft.Apply(b, s.ApplyTimeout)
 	if af.Error() != nil {
 		if af.Error() == raft.ErrNotLeader {
 			return nil, ErrNotLeader
@@ -806,16 +973,14 @@ func (s *Store) Query(qr *command.QueryRequest) ([]*command.QueryRows, error) {
 			return nil, ErrNotLeader
 		}
 
-		b, compressed, err := s.reqMarshaller.Marshal(qr)
+		if !s.Ready() {
+			return nil, ErrNotReady
+		}
+
+		b, compressed, err := s.tryCompress(qr)
 		if err != nil {
 			return nil, err
 		}
-		if compressed {
-			stats.Add(numCompressedCommands, 1)
-		} else {
-			stats.Add(numUncompressedCommands, 1)
-		}
-
 		c := &command.Command{
 			Type:       command.Command_COMMAND_TYPE_QUERY,
 			SubCommand: b,
@@ -827,7 +992,7 @@ func (s *Store) Query(qr *command.QueryRequest) ([]*command.QueryRows, error) {
 			return nil, err
 		}
 
-		af := s.raft.Apply(b, s.ApplyTimeout).(raft.ApplyFuture)
+		af := s.raft.Apply(b, s.ApplyTimeout)
 		if af.Error() != nil {
 			if af.Error() == raft.ErrNotLeader {
 				return nil, ErrNotLeader
@@ -861,6 +1026,65 @@ func (s *Store) Query(qr *command.QueryRequest) ([]*command.QueryRows, error) {
 	return s.db.Query(qr.Request, qr.Timings)
 }
 
+// Request processes a request that may contain both Executes and Queries.
+func (s *Store) Request(eqr *command.ExecuteQueryRequest) ([]*command.ExecuteQueryResponse, error) {
+	if !s.open {
+		return nil, ErrNotOpen
+	}
+
+	if !s.RequiresLeader(eqr) {
+		if eqr.Level == command.QueryRequest_QUERY_REQUEST_LEVEL_NONE && eqr.Freshness > 0 &&
+			time.Since(s.raft.LastContact()).Nanoseconds() > eqr.Freshness {
+			return nil, ErrStaleRead
+		}
+		if eqr.Request.Transaction {
+			// Transaction requested during query, but not going through consensus. This means
+			// we need to block any database serialization during the query.
+			s.queryTxMu.RLock()
+			defer s.queryTxMu.RUnlock()
+		}
+		return s.db.Request(eqr.Request, eqr.Timings)
+	}
+
+	if s.raft.State() != raft.Leader {
+		return nil, ErrNotLeader
+	}
+
+	if !s.Ready() {
+		return nil, ErrNotReady
+	}
+
+	b, compressed, err := s.tryCompress(eqr)
+	if err != nil {
+		return nil, err
+	}
+
+	c := &command.Command{
+		Type:       command.Command_COMMAND_TYPE_EXECUTE_QUERY,
+		SubCommand: b,
+		Compressed: compressed,
+	}
+
+	b, err = command.Marshal(c)
+	if err != nil {
+		return nil, err
+	}
+
+	af := s.raft.Apply(b, s.ApplyTimeout)
+	if af.Error() != nil {
+		if af.Error() == raft.ErrNotLeader {
+			return nil, ErrNotLeader
+		}
+		return nil, af.Error()
+	}
+
+	s.dbAppliedIndexMu.Lock()
+	s.dbAppliedIndex = af.Index()
+	s.dbAppliedIndexMu.Unlock()
+	r := af.Response().(*fsmExecuteQueryResponse)
+	return r.results, r.error
+}
+
 // Backup writes a snapshot of the underlying database to dst
 //
 // If Leader is true for the request, this operation is performed with a read consistency
@@ -884,7 +1108,7 @@ func (s *Store) Backup(br *command.BackupRequest, dst io.Writer) (retErr error) 
 	}
 
 	if br.Format == command.BackupRequest_BACKUP_REQUEST_FORMAT_BINARY {
-		f, err := ioutil.TempFile("", "rqlilte-snap-")
+		f, err := os.CreateTemp("", "rqlite-snap-")
 		if err != nil {
 			return err
 		}
@@ -911,6 +1135,16 @@ func (s *Store) Backup(br *command.BackupRequest, dst io.Writer) (retErr error) 
 	return ErrInvalidBackupFormat
 }
 
+// Provide implements the uploader Provider interface, allowing the
+// Store to be used as a DataProvider for an uploader.
+func (s *Store) Provide(path string) error {
+	if err := s.db.Backup(path); err != nil {
+		return err
+	}
+	stats.Add(numProvides, 1)
+	return nil
+}
+
 // Loads an entire SQLite file into the database, sending the request
 // through the Raft log.
 func (s *Store) Load(lr *command.LoadRequest) error {
@@ -918,6 +1152,20 @@ func (s *Store) Load(lr *command.LoadRequest) error {
 		return ErrNotOpen
 	}
 
+	if !s.Ready() {
+		return ErrNotReady
+	}
+
+	if err := s.load(lr); err != nil {
+		return err
+	}
+	stats.Add(numLoads, 1)
+	return nil
+}
+
+// load loads an entire SQLite file into the database, and is for internal use
+// only. It does not check for readiness, and does not update statistics.
+func (s *Store) load(lr *command.LoadRequest) error {
 	startT := time.Now()
 
 	b, err := command.MarshalLoadRequest(lr)
@@ -936,7 +1184,7 @@ func (s *Store) Load(lr *command.LoadRequest) error {
 		return err
 	}
 
-	af := s.raft.Apply(b, s.ApplyTimeout).(raft.ApplyFuture)
+	af := s.raft.Apply(b, s.ApplyTimeout)
 	if af.Error() != nil {
 		if af.Error() == raft.ErrNotLeader {
 			return ErrNotLeader
@@ -948,9 +1196,9 @@ func (s *Store) Load(lr *command.LoadRequest) error {
 	s.dbAppliedIndexMu.Lock()
 	s.dbAppliedIndex = af.Index()
 	s.dbAppliedIndexMu.Unlock()
-	stats.Add(numLoads, 1)
-	s.logger.Printf("node loaded with in %s (%d bytes)", time.Since(startT), len(b))
-	return af.Error()
+	s.logger.Printf("node loaded in %s (%d bytes)", time.Since(startT), len(b))
+
+	return nil
 }
 
 // Notify notifies this Store that a node is ready for bootstrapping at the
@@ -960,7 +1208,7 @@ func (s *Store) Load(lr *command.LoadRequest) error {
 // with the *advertised Raft address* which the Store doesn't know about.
 //
 // Notifying is idempotent. A node may repeatedly notify the Store without issue.
-func (s *Store) Notify(id, addr string) error {
+func (s *Store) Notify(nr *command.NotifyRequest) error {
 	if !s.open {
 		return ErrNotOpen
 	}
@@ -973,10 +1221,10 @@ func (s *Store) Notify(id, addr string) error {
 		return nil
 	}
 
-	if _, ok := s.notifyingNodes[id]; ok {
+	if _, ok := s.notifyingNodes[nr.Id]; ok {
 		return nil
 	}
-	s.notifyingNodes[id] = &Server{id, addr, "voter"}
+	s.notifyingNodes[nr.Id] = &Server{nr.Id, nr.Address, "voter"}
 	if len(s.notifyingNodes) < s.BootstrapExpect {
 		return nil
 	}
@@ -993,7 +1241,7 @@ func (s *Store) Notify(id, addr string) error {
 		s.BootstrapExpect)
 	bf := s.raft.BootstrapCluster(raft.Configuration{
 		Servers: raftServers,
-	}).(raft.Future)
+	})
 	if bf.Error() != nil {
 		s.logger.Printf("cluster bootstrap failed: %s", bf.Error())
 	} else {
@@ -1005,7 +1253,7 @@ func (s *Store) Notify(id, addr string) error {
 
 // Join joins a node, identified by id and located at addr, to this store.
 // The node must be ready to respond to Raft communications at that address.
-func (s *Store) Join(id, addr string, voter bool) error {
+func (s *Store) Join(jr *command.JoinRequest) error {
 	if !s.open {
 		return ErrNotOpen
 	}
@@ -1013,6 +1261,10 @@ func (s *Store) Join(id, addr string, voter bool) error {
 	if s.raft.State() != raft.Leader {
 		return ErrNotLeader
 	}
+
+	id := jr.Id
+	addr := jr.Address
+	voter := jr.Voter
 
 	configFuture := s.raft.GetConfiguration()
 	if err := configFuture.Error(); err != nil {
@@ -1046,7 +1298,6 @@ func (s *Store) Join(id, addr string, voter bool) error {
 	if voter {
 		f = s.raft.AddVoter(raft.ServerID(id), raft.ServerAddress(addr), 0, 0)
 	} else {
-
 		f = s.raft.AddNonvoter(raft.ServerID(id), raft.ServerAddress(addr), 0, 0)
 	}
 	if e := f.(raft.Future); e.Error() != nil {
@@ -1098,7 +1349,7 @@ func (s *Store) Noop(id string) error {
 		return err
 	}
 
-	af := s.raft.Apply(bc, s.ApplyTimeout).(raft.ApplyFuture)
+	af := s.raft.Apply(bc, s.ApplyTimeout)
 	if af.Error() != nil {
 		if af.Error() == raft.ErrNotLeader {
 			return ErrNotLeader
@@ -1108,6 +1359,26 @@ func (s *Store) Noop(id string) error {
 	return nil
 }
 
+// RequiresLeader returns whether the given ExecuteQueryRequest must be
+// processed on the cluster Leader.
+func (s *Store) RequiresLeader(eqr *command.ExecuteQueryRequest) bool {
+	if eqr.Level != command.QueryRequest_QUERY_REQUEST_LEVEL_NONE {
+		return true
+	}
+
+	for _, stmt := range eqr.Request.Statements {
+		sql := stmt.Sql
+		if sql == "" {
+			continue
+		}
+		ro, err := s.db.StmtReadOnly(sql)
+		if !ro || err != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // setLogInfo records some key indexs about the log.
 func (s *Store) setLogInfo() error {
 	var err error
@@ -1115,11 +1386,15 @@ func (s *Store) setLogInfo() error {
 	if err != nil {
 		return fmt.Errorf("failed to get last index: %s", err)
 	}
+	s.lastAppliedIdxOnOpen, err = s.boltStore.GetAppliedIndex()
+	if err != nil {
+		return fmt.Errorf("failed to get last applied index: %s", err)
+	}
 	s.lastIdxOnOpen, err = s.boltStore.LastIndex()
 	if err != nil {
 		return fmt.Errorf("failed to get last index: %s", err)
 	}
-	s.lastCommandIdxOnOpen, err = s.boltStore.LastCommandIndex()
+	s.lastCommandIdxOnOpen, err = s.boltStore.LastCommandIndex(s.firstIdxOnOpen, s.lastAppliedIdxOnOpen)
 	if err != nil {
 		return fmt.Errorf("failed to get last command index: %s", err)
 	}
@@ -1128,19 +1403,11 @@ func (s *Store) setLogInfo() error {
 
 // remove removes the node, with the given ID, from the cluster.
 func (s *Store) remove(id string) error {
-	if s.raft.State() != raft.Leader {
+	f := s.raft.RemoveServer(raft.ServerID(id), 0, 0)
+	if f.Error() != nil && f.Error() == raft.ErrNotLeader {
 		return ErrNotLeader
 	}
-
-	f := s.raft.RemoveServer(raft.ServerID(id), 0, 0)
-	if f.Error() != nil {
-		if f.Error() == raft.ErrNotLeader {
-			return ErrNotLeader
-		}
-		return f.Error()
-	}
-
-	return nil
+	return f.Error()
 }
 
 // raftConfig returns a new Raft config for the store.
@@ -1168,6 +1435,31 @@ func (s *Store) raftConfig() *raft.Config {
 	return config
 }
 
+func (s *Store) updateAppliedIndex() chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(appliedIndexUpdateInterval)
+		defer ticker.Stop()
+		var idx uint64
+		for {
+			select {
+			case <-ticker.C:
+				newIdx := s.raft.AppliedIndex()
+				if newIdx == idx {
+					continue
+				}
+				idx = newIdx
+				if err := s.boltStore.SetAppliedIndex(idx); err != nil {
+					s.logger.Printf("failed to set applied index: %s", err.Error())
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+	return done
+}
+
 type fsmExecuteResponse struct {
 	results []*command.ExecuteResult
 	error   error
@@ -1176,6 +1468,11 @@ type fsmExecuteResponse struct {
 type fsmQueryResponse struct {
 	rows  []*command.QueryRows
 	error error
+}
+
+type fsmExecuteQueryResponse struct {
+	results []*command.ExecuteQueryResponse
+	error   error
 }
 
 type fsmGenericResponse struct {
@@ -1194,38 +1491,8 @@ func (s *Store) Apply(l *raft.Log) (e interface{}) {
 			// opened.
 			s.appliedOnOpen++
 			if l.Index == s.lastCommandIdxOnOpen {
-				s.logger.Printf("%d committed log entries applied in %s, took %s since open",
+				s.logger.Printf("%d confirmed committed log entries applied in %s, took %s since open",
 					s.appliedOnOpen, time.Since(s.firstLogAppliedT), time.Since(s.openT))
-
-				// Last command log applied. Time to switch to on-disk database?
-				if s.dbConf.Memory {
-					s.logger.Println("continuing use of in-memory database")
-				} else if s.onDiskCreated {
-					s.logger.Println("continuing use of on-disk database")
-				} else {
-					// Since we're here, it means that a) an on-disk database was requested,
-					// b) in-memory creation of the on-disk database is enabled, and c) there
-					// were commands in the log. A snapshot may or may not have been applied,
-					// but it wouldn't have created the on-disk database in that case since
-					// there were commands in the log. This is the very last chance to convert
-					// from in-memory to on-disk.
-					s.queryTxMu.Lock()
-					defer s.queryTxMu.Unlock()
-					b, _ := s.db.Serialize()
-					err := s.db.Close()
-					if err != nil {
-						e = &fsmGenericResponse{error: fmt.Errorf("close failed: %s", err)}
-						return
-					}
-					// Open a new on-disk database.
-					s.db, err = createOnDisk(b, s.dbPath, s.dbConf.FKConstraints)
-					if err != nil {
-						e = &fsmGenericResponse{error: fmt.Errorf("open on-disk failed: %s", err)}
-						return
-					}
-					s.onDiskCreated = true
-					s.logger.Println("successfully switched to on-disk database")
-				}
 			}
 		}
 	}()
@@ -1275,7 +1542,7 @@ func (s *Store) Snapshot() (raft.FSMSnapshot, error) {
 
 	s.queryTxMu.Lock()
 	defer s.queryTxMu.Unlock()
-	fsm := newFSMSnapshot(s.db, s.logger)
+	fsm := NewFSMSnapshot(s.db, s.logger)
 	dur := time.Since(fsm.startT)
 	stats.Add(numSnaphots, 1)
 	stats.Get(snapshotCreateDuration).(*expvar.Int).Set(dur.Milliseconds())
@@ -1286,8 +1553,7 @@ func (s *Store) Snapshot() (raft.FSMSnapshot, error) {
 
 // Restore restores the node to a previous state. The Hashicorp docs state this
 // will not be called concurrently with Apply(), so synchronization with Execute()
-// is not necessary.To prevent problems during queries, which may not go through
-// the log, it blocks all query requests.
+// is not necessary.
 func (s *Store) Restore(rc io.ReadCloser) error {
 	startT := time.Now()
 	b, err := dbBytesFromSnapshot(rc)
@@ -1303,33 +1569,24 @@ func (s *Store) Restore(rc io.ReadCloser) error {
 	}
 
 	var db *sql.DB
-	if s.StartupOnDisk || (!s.dbConf.Memory && s.lastCommandIdxOnOpen == 0) {
-		// A snapshot clearly exists (this function has been called) but there
-		// are no command entries in the log -- so Apply will not be called.
-		// Therefore, this is the last opportunity to create the on-disk database
-		// before Raft starts. This could also happen because the user has explicitly
-		// disabled the build-on-disk-database-in-memory-first optimization.
-		db, err = createOnDisk(b, s.dbPath, s.dbConf.FKConstraints)
+	if s.dbConf.Memory {
+		db, err = createInMemory(b, s.dbConf.FKConstraints)
+		if err != nil {
+			return fmt.Errorf("createInMemory: %s", err)
+		}
+	} else {
+		db, err = createOnDisk(b, s.dbPath, s.dbConf.FKConstraints, !s.dbConf.DisableWAL)
 		if err != nil {
 			return fmt.Errorf("open on-disk file during restore: %s", err)
 		}
 		s.onDiskCreated = true
 		s.logger.Println("successfully switched to on-disk database due to restore")
-	} else {
-		// Deserialize into an in-memory database because a) an in-memory database
-		// has been requested, or b) while there was a snapshot, there are also
-		// command entries in the log. So by sticking with an in-memory database
-		// those entries will be applied in the fastest possible manner. We will
-		// defer creation of any database on disk until the Apply function.
-		db, err = createInMemory(b, s.dbConf.FKConstraints)
-		if err != nil {
-			return fmt.Errorf("createInMemory: %s", err)
-		}
 	}
 	s.db = db
 
 	stats.Add(numRestores, 1)
 	s.logger.Printf("node restored in %s", time.Since(startT))
+	rc.Close()
 	return nil
 }
 
@@ -1403,6 +1660,7 @@ func (s *Store) observe() (closeCh, doneCh chan struct{}) {
 						}
 					}
 					s.leaderObserversMu.RUnlock()
+					s.selfLeaderChange(signal.LeaderID == raft.ServerID(s.raftID))
 				}
 
 			case <-closeCh:
@@ -1411,6 +1669,53 @@ func (s *Store) observe() (closeCh, doneCh chan struct{}) {
 		}
 	}()
 	return closeCh, doneCh
+}
+
+// selfLeaderChange is called when this node detects that its leadership
+// status has changed.
+func (s *Store) selfLeaderChange(leader bool) {
+	if s.restorePath != "" {
+		defer func() {
+			// Whatever happens, this is a one-shot attempt to perform a restore
+			err := os.Remove(s.restorePath)
+			if err != nil {
+				s.logger.Printf("failed to remove restore path after restore %s: %s",
+					s.restorePath, err.Error())
+			}
+			s.restorePath = ""
+			close(s.restoreDoneCh)
+		}()
+
+		if !leader {
+			s.logger.Printf("different node became leader, not performing auto-restore")
+			stats.Add(numAutoRestoresSkipped, 1)
+		} else {
+			s.logger.Printf("this node is now leader, auto-restoring from %s", s.restorePath)
+			if err := s.installRestore(); err != nil {
+				s.logger.Printf("failed to auto-restore from %s: %s", s.restorePath, err.Error())
+				stats.Add(numAutoRestoresFailed, 1)
+				return
+			}
+			stats.Add(numAutoRestores, 1)
+			s.logger.Printf("node auto-restored successfully from %s", s.restorePath)
+		}
+	}
+}
+
+func (s *Store) installRestore() error {
+	f, err := os.Open(s.restorePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return err
+	}
+	lr := &command.LoadRequest{
+		Data: b,
+	}
+	return s.load(lr)
 }
 
 // logSize returns the size of the Raft log on disk.
@@ -1422,127 +1727,28 @@ func (s *Store) logSize() (int64, error) {
 	return fi.Size(), nil
 }
 
-func (s *Store) databaseTypePretty() string {
-	if s.dbConf.Memory {
-		return "in-memory"
-	}
-	return "on-disk"
-}
-
-type fsmSnapshot struct {
-	startT time.Time
-	logger *log.Logger
-
-	database []byte
-}
-
-func newFSMSnapshot(db *sql.DB, logger *log.Logger) *fsmSnapshot {
-	fsm := &fsmSnapshot{
-		startT: time.Now(),
-		logger: logger,
-	}
-
-	// The error code is not meaningful from Serialize(). The code needs to be able
-	// to handle a nil byte slice being returned.
-	fsm.database, _ = db.Serialize()
-	return fsm
-}
-
-// Persist writes the snapshot to the given sink.
-func (f *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
-	defer func() {
-		dur := time.Since(f.startT)
-		stats.Get(snapshotPersistDuration).(*expvar.Int).Set(dur.Milliseconds())
-		f.logger.Printf("snapshot and persist took %s", dur)
-	}()
-
-	err := func() error {
-		b := new(bytes.Buffer)
-
-		// Flag compressed database by writing max uint64 value first.
-		// No SQLite database written by earlier versions will have this
-		// as a size. *Surely*.
-		err := writeUint64(b, math.MaxUint64)
-		if err != nil {
-			return err
-		}
-		if _, err := sink.Write(b.Bytes()); err != nil {
-			return err
-		}
-		b.Reset() // Clear state of buffer for future use.
-
-		// Get compressed copy of database.
-		cdb, err := f.compressedDatabase()
-		if err != nil {
-			return err
-		}
-
-		if cdb != nil {
-			// Write size of compressed database.
-			err = writeUint64(b, uint64(len(cdb)))
-			if err != nil {
-				return err
-			}
-			if _, err := sink.Write(b.Bytes()); err != nil {
-				return err
-			}
-
-			// Write compressed database to sink.
-			if _, err := sink.Write(cdb); err != nil {
-				return err
-			}
-			stats.Get(snapshotDBOnDiskSize).(*expvar.Int).Set(int64(len(cdb)))
-		} else {
-			f.logger.Println("no database data available for snapshot")
-			err = writeUint64(b, uint64(0))
-			if err != nil {
-				return err
-			}
-			if _, err := sink.Write(b.Bytes()); err != nil {
-				return err
-			}
-			stats.Get(snapshotDBOnDiskSize).(*expvar.Int).Set(0)
-		}
-
-		// Close the sink.
-		return sink.Close()
-	}()
-
+// tryCompress attempts to compress the given command. If the command is
+// successfully compressed, the compressed byte slice is returned, along with
+// a boolean true. If the command cannot be compressed, the uncompressed byte
+// slice is returned, along with a boolean false. The stats are updated
+// accordingly.
+func (s *Store) tryCompress(rq command.Requester) ([]byte, bool, error) {
+	b, compressed, err := s.reqMarshaller.Marshal(rq)
 	if err != nil {
-		sink.Cancel()
-		return err
+		return nil, false, err
 	}
-
-	return nil
+	if compressed {
+		stats.Add(numCompressedCommands, 1)
+	} else {
+		stats.Add(numUncompressedCommands, 1)
+	}
+	return b, compressed, nil
 }
-
-func (f *fsmSnapshot) compressedDatabase() ([]byte, error) {
-	if f.database == nil {
-		return nil, nil
-	}
-
-	var buf bytes.Buffer
-	gz, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
-	if err != nil {
-		return nil, err
-	}
-
-	if _, err := gz.Write(f.database); err != nil {
-		return nil, err
-	}
-	if err := gz.Close(); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-// Release is a no-op.
-func (f *fsmSnapshot) Release() {}
 
 // RecoverNode is used to manually force a new configuration, in the event that
 // quorum cannot be restored. This borrows heavily from RecoverCluster functionality
 // of the Hashicorp Raft library, but has been customized for rqlite use.
-func RecoverNode(dataDir string, logger *log.Logger, logs raft.LogStore, stable raft.StableStore,
+func RecoverNode(dataDir string, logger *log.Logger, logs raft.LogStore, stable *rlog.Log,
 	snaps raft.SnapshotStore, tn raft.Transport, conf raft.Configuration) error {
 	logPrefix := logger.Prefix()
 	logger.SetPrefix(fmt.Sprintf("%s[recovery] ", logPrefix))
@@ -1593,7 +1799,7 @@ func RecoverNode(dataDir string, logger *log.Logger, logs raft.LogStore, stable 
 	// Now, create an in-memory database for temporary use, so we can generate new
 	// snapshots later.
 	var db *sql.DB
-	if b == nil || len(b) == 0 {
+	if len(b) == 0 {
 		db, err = sql.OpenInMemory(false)
 	} else {
 		db, err = sql.DeserializeIntoMemory(b, false)
@@ -1629,7 +1835,7 @@ func RecoverNode(dataDir string, logger *log.Logger, logs raft.LogStore, stable 
 
 	// Create a new snapshot, placing the configuration in as if it was
 	// committed at index 1.
-	snapshot := newFSMSnapshot(db, logger)
+	snapshot := NewFSMSnapshot(db, logger)
 	sink, err := snaps.Create(1, lastIndex, lastTerm, conf, 1, tn)
 	if err != nil {
 		return fmt.Errorf("failed to create snapshot: %v", err)
@@ -1652,64 +1858,22 @@ func RecoverNode(dataDir string, logger *log.Logger, logs raft.LogStore, stable 
 		return fmt.Errorf("log compaction failed: %v", err)
 	}
 
+	// Erase record of previous updating of Applied Index too.
+	if err := stable.SetAppliedIndex(0); err != nil {
+		return fmt.Errorf("failed to zero applied index: %v", err)
+	}
+
 	return nil
 }
 
 func dbBytesFromSnapshot(rc io.ReadCloser) ([]byte, error) {
-	var uint64Size uint64
-	inc := int64(unsafe.Sizeof(uint64Size))
-
-	// Read all the data into RAM, since we have to decode known-length
-	// chunks of various forms.
-	var offset int64
-	b, err := ioutil.ReadAll(rc)
+	var database bytes.Buffer
+	decoder := snapshot.NewV1Decoder(rc)
+	_, err := decoder.WriteTo(&database)
 	if err != nil {
-		return nil, fmt.Errorf("readall: %s", err)
+		return nil, err
 	}
-
-	// Get size of database, checking for compression.
-	compressed := false
-	sz, err := readUint64(b[offset : offset+inc])
-	if err != nil {
-		return nil, fmt.Errorf("read compression check: %s", err)
-	}
-	offset = offset + inc
-
-	if sz == math.MaxUint64 {
-		compressed = true
-		// Database is actually compressed, read actual size next.
-		sz, err = readUint64(b[offset : offset+inc])
-		if err != nil {
-			return nil, fmt.Errorf("read compressed size: %s", err)
-		}
-		offset = offset + inc
-	}
-
-	// Now read in the database file data, decompress if necessary, and restore.
-	var database []byte
-	if sz > 0 {
-		if compressed {
-			buf := new(bytes.Buffer)
-			gz, err := gzip.NewReader(bytes.NewReader(b[offset : offset+int64(sz)]))
-			if err != nil {
-				return nil, err
-			}
-
-			if _, err := io.Copy(buf, gz); err != nil {
-				return nil, fmt.Errorf("SQLite database decompress: %s", err)
-			}
-
-			if err := gz.Close(); err != nil {
-				return nil, err
-			}
-			database = buf.Bytes()
-		} else {
-			database = b[offset : offset+int64(sz)]
-		}
-	} else {
-		database = nil
-	}
-	return database, nil
+	return database.Bytes(), nil
 }
 
 func applyCommand(data []byte, pDB **sql.DB) (command.Command_Type, interface{}) {
@@ -1735,6 +1899,13 @@ func applyCommand(data []byte, pDB **sql.DB) (command.Command_Type, interface{})
 		}
 		r, err := db.Execute(er.Request, er.Timings)
 		return c.Type, &fsmExecuteResponse{results: r, error: err}
+	case command.Command_COMMAND_TYPE_EXECUTE_QUERY:
+		var eqr command.ExecuteQueryRequest
+		if err := command.UnmarshalSubCommand(&c, &eqr); err != nil {
+			panic(fmt.Sprintf("failed to unmarshal execute-query subcommand: %s", err.Error()))
+		}
+		r, err := db.Request(eqr.Request, eqr.Timings)
+		return c.Type, &fsmExecuteQueryResponse{results: r, error: err}
 	case command.Command_COMMAND_TYPE_LOAD:
 		var lr command.LoadRequest
 		if err := command.UnmarshalLoadRequest(c.SubCommand, &lr); err != nil {
@@ -1749,7 +1920,7 @@ func applyCommand(data []byte, pDB **sql.DB) (command.Command_Type, interface{})
 				return c.Type, &fsmGenericResponse{error: fmt.Errorf("failed to create in-memory database: %s", err)}
 			}
 		} else {
-			newDB, err = createOnDisk(lr.Data, db.Path(), db.FKEnabled())
+			newDB, err = createOnDisk(lr.Data, db.Path(), db.FKEnabled(), db.WALEnabled())
 			if err != nil {
 				return c.Type, &fsmGenericResponse{error: fmt.Errorf("failed to create on-disk database: %s", err)}
 			}
@@ -1781,6 +1952,13 @@ func checkRaftConfiguration(configuration raft.Configuration) error {
 		if server.Address == "" {
 			return fmt.Errorf("empty address in configuration: %v", server)
 		}
+		if strings.Contains(string(server.Address), "://") {
+			return fmt.Errorf("protocol specified in address: %v", server.Address)
+		}
+		_, _, err := net.SplitHostPort(string(server.Address))
+		if err != nil {
+			return fmt.Errorf("invalid address in configuration: %v", server.Address)
+		}
 		if idSet[server.ID] {
 			return fmt.Errorf("found duplicate ID in configuration: %v", server.ID)
 		}
@@ -1802,7 +1980,7 @@ func checkRaftConfiguration(configuration raft.Configuration) error {
 // createInMemory returns an in-memory database. If b is non-nil and non-empty,
 // then the database will be initialized with the contents of b.
 func createInMemory(b []byte, fkConstraints bool) (db *sql.DB, err error) {
-	if b == nil || len(b) == 0 {
+	if len(b) == 0 {
 		db, err = sql.OpenInMemory(fkConstraints)
 	} else {
 		db, err = sql.DeserializeIntoMemory(b, fkConstraints)
@@ -1813,8 +1991,8 @@ func createInMemory(b []byte, fkConstraints bool) (db *sql.DB, err error) {
 // createOnDisk opens an on-disk database file at the configured path. If b is
 // non-nil, any preexisting file will first be overwritten with those contents.
 // Otherwise, any preexisting file will be removed before the database is opened.
-func createOnDisk(b []byte, path string, fkConstraints bool) (*sql.DB, error) {
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+func createOnDisk(b []byte, path string, fkConstraints, wal bool) (*sql.DB, error) {
+	if err := sql.RemoveFiles(path); err != nil {
 		return nil, err
 	}
 	if b != nil {
@@ -1822,19 +2000,7 @@ func createOnDisk(b []byte, path string, fkConstraints bool) (*sql.DB, error) {
 			return nil, err
 		}
 	}
-	return sql.Open(path, fkConstraints)
-}
-
-func readUint64(b []byte) (uint64, error) {
-	var sz uint64
-	if err := binary.Read(bytes.NewReader(b), binary.LittleEndian, &sz); err != nil {
-		return 0, err
-	}
-	return sz, nil
-}
-
-func writeUint64(w io.Writer, v uint64) error {
-	return binary.Write(w, binary.LittleEndian, v)
+	return sql.Open(path, fkConstraints, wal)
 }
 
 // enabledFromBool converts bool to "enabled" or "disabled".
@@ -1866,6 +2032,11 @@ func dirSize(path string) (int64, error) {
 	var size int64
 	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
 		if err != nil {
+			// If the file doesn't exist, we can ignore it. Snapshot files might
+			// disappear during walking.
+			if os.IsNotExist(err) {
+				return nil
+			}
 			return err
 		}
 		if !info.IsDir() {

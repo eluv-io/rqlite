@@ -1,6 +1,175 @@
-## 7.13.2 (unreleased)
+## 7.21.4 (July 8th 2023)
+### Implementation changes and bug fixes
+- [PR #1336](https://github.com/rqlite/rqlite/pull/1336): Remove on-disk-startup control. It's no longer needed as on-disk performance is now very close to in-memory performance, thanks to the switch to _synchronous off_ mode and the use of the SQLite WAL.
+
+## 7.21.3 (July 7th 2023)
+### Implementation changes and bug fixes
+- [PR #1329](https://github.com/rqlite/rqlite/pull/1329): Try a different version of V2 Snapshot codec.
+- [PR #1332](https://github.com/rqlite/rqlite/pull/1332): Upgrade dependencies.
+- [PR #1333](https://github.com/rqlite/rqlite/pull/1333): Set "types" for expressions e.g. `COUNT`. Fixes [issue #1330](https://github.com/rqlite/rqlite/issues/1330)
+
+## 7.21.2 (July 1st 2023)
+### Implementation changes and bug fixes
+- [PR #1321](https://github.com/rqlite/rqlite/pull/1321): Check for errors in responses during load testing.
+- [PR #1323](https://github.com/rqlite/rqlite/pull/1323): Add codec for v2 snapshots.
+- [PR #1324](https://github.com/rqlite/rqlite/pull/1324): Close Snapshot after we're finished restoring from it.
+- [PR #1325](https://github.com/rqlite/rqlite/pull/1325): Handle getting an error when asking for database stats.
+
+## 7.21.1 (June 26th 2023)
+This release changes the mode of SQLite, when rqlite is running in _on-disk_ mode. SQLite now runs in WAL mode, when previously it was in DELETE mode. Testing shows this results in a ~30% increase in write-performance.
+
+### Implementation changes and bug fixes
+- [PR #1314](https://github.com/rqlite/rqlite/pull/1314): More preparations for WAL mode when running on-disk.
+- [PR #1315](https://github.com/rqlite/rqlite/pull/1315), [PR #1316](https://github.com/rqlite/rqlite/pull/1316): Enable WAL when running in on-disk mode.
+- [PR #1317](https://github.com/rqlite/rqlite/pull/1317): DB-layer now supports WAL replay.
+- [PR #1318](https://github.com/rqlite/rqlite/pull/1318): Periodically record actual applied index. Addresses a possible edge case with on-disk startup.
+  
+## 7.21.0 (June 20th 2023)
+### New features
+- [PR #1311](https://github.com/rqlite/rqlite/pull/1311): Support 'key' param on the `/status` HTTP endpoint.
+- [PR #1313](https://github.com/rqlite/rqlite/pull/1313): Sysdump now retrieves data from all nodes if possible.
+
+### Implementation changes and bug fixes
+- [PR #1309](https://github.com/rqlite/rqlite/pull/1309): Factor Snapshot creation into own module.
+
+## 7.20.6 (June 16th 2023)
+### Implementation changes and bug fixes
+- [PR #1305](https://github.com/rqlite/rqlite/pull/1305): Upgrade dependencies via `go get`.
+- [PR #1306](https://github.com/rqlite/rqlite/pull/1306): Add some (currently unused) WAL control code.
+- [PR #1307](https://github.com/rqlite/rqlite/pull/1307), [PR #1308](https://github.com/rqlite/rqlite/pull/1308): Add full WAL-support to database layer. Not yet enabled by full application.
+
+## 7.20.5 (June 14th 2023)
+### Implementation changes and bug fixes
+- [PR #1302](https://github.com/rqlite/rqlite/pull/1302): Add some important PRAGMA state to database-level status reporting.
+- [PR #1303](https://github.com/rqlite/rqlite/pull/1303): Reduce disk space usage by retaining only a single Raft SQLite snapshot.
+
+## 7.20.4 (June 13th 2023)
+This release changes the "syncing" mode SQLite uses to _OFF_ when rqlite runs in "on-disk" mode. The [SQLite docs](https://www.sqlite.org/pragma.html#pragma_synchronous) state that this risks database corruption in the event of a crash, but that's a non-issue for rqlite, as rqlite always deletes any SQLite database on startup and rebuilds it from the Raft log. Testing shows this change results in (at least) a 3x speed-up in write performance when operating in "on-disk" mode.
+
+### Implementation changes and bug fixes
+- [PR #1301](https://github.com/rqlite/rqlite/pull/1301): Set sychronous mode to `OFF` for SQLite on-disk files.
+
+## 7.20.3 (June 12th 2023)
+### Implementation changes and bug fixes
+- [PR #1298](https://github.com/rqlite/rqlite/pull/1298): Move FSMSnapshot to own source file.
+- [PR #1300](https://github.com/rqlite/rqlite/pull/1300): Check for WAL-enabled SQLite files during load and restore.
+
+## 7.20.2 (June 9th 2023)
+### Implementation changes and bug fixes
+- [PR #1296](https://github.com/rqlite/rqlite/pull/1296): Use correct connection when checking a SQL statement for "read-only" status, otherwise "database locked" could result. Also refactors much of the DB-level unit tests.
+
+## 7.20.1 (June 1st 2023)
+### Implementation changes and bug fixes
+- [PR #1291](https://github.com/rqlite/rqlite/pull/1291): Allow bootstrap-join even with preexisting state. Fixes [issue #1290](https://github.com/rqlite/rqlite/issues/1290) 
+
+## 7.20.0 (June 1st 2023)
+### New features
+- [PR #1288](https://github.com/rqlite/rqlite/pull/1288): Upgrade to SQLite 3.42.0.
+
+### Implementation changes and bug fixes
+- [PR #1286](https://github.com/rqlite/rqlite/pull/1286): More validation of passed-in network addresses.
+
+## 7.19.0 (May 23rd 2023)
+### New features
+- [PR #1278](https://github.com/rqlite/rqlite/pull/1278): Enable support for more CPU architectures. Fixes [issue #901](https://github.com/rqlite/rqlite/issues/901)
+
+### Implementation changes and bug fixes
+- [PR #1275](https://github.com/rqlite/rqlite/pull/1275): Node-removal performs retries.
+- [PR #1277](https://github.com/rqlite/rqlite/pull/1277): Upgrade dependencies.
+- [PR #1279](https://github.com/rqlite/rqlite/pull/1279): Move to custom image to speed up testing on CircleCI.
+
+## 7.18.2 (May 22nd 2023)
+### Implementation changes and bug fixes
+- [PR #1269](https://github.com/rqlite/rqlite/pull/1269): Add WaitForRemoval() to Store.
+- [PR #1270](https://github.com/rqlite/rqlite/pull/1270): Confirm self-removal changes cluster config.
+- [PR #1272](https://github.com/rqlite/rqlite/pull/1272): Refactor node self-removal on shutdown.
+- [PR #1273](https://github.com/rqlite/rqlite/pull/1273): Make WaitForLeader() more consistent.
+- [PR #1274](https://github.com/rqlite/rqlite/pull/1274): Do DNS boostrapping even if there is pre-existing state. Fixes [issue #1247](https://github.com/rqlite/rqlite/issues/1247)
+
+## 7.18.1 (May 20th 2023)
+This release also includes some small logging improvements, related to node-shutdown.
+
+### Implementation changes and bug fixes
+- [PR #1266](https://github.com/rqlite/rqlite/pull/1266), [PR #1268](https://github.com/rqlite/rqlite/pull/1268): Add network information to `/status`.
+- [PR #1267](https://github.com/rqlite/rqlite/pull/1267): Reduce self-remove timeout to 5 seconds.
+
+## 7.18.0 (May 18th 2023)
+This release adds a new HTTP endpoint, located at `/db/request`. This endpoint accepts both read and write requests, including mixing both together in a single request. When requests are sent to this endpoint, rqlite will automatically perform the correct operation for each SQL statement in the request. This endpoint may be more convenient for some use cases, and means that client code doesn't have to decide on whether it should send requests to `/db/execute` or `/db/query`. Many thanks to [VOXO](https://voxo.co/) for funding this development.
+
+7.18.0 also includes some small improvements to [diagnostics and instrumentation](https://rqlite.io/docs/guides/monitoring-rqlite/).
+
+### New features
+- [PR #1256](https://github.com/rqlite/rqlite/pull/1256), [PR #1258](https://github.com/rqlite/rqlite/pull/1258), [PR #1260](https://github.com/rqlite/rqlite/pull/1260), [PR #1261](https://github.com/rqlite/rqlite/pull/1261), [PR #1265](https://github.com/rqlite/rqlite/pull/1265): Support a _Unified Endpoint_, which can accept both read and write requests. Fixes [issue #263](https://github.com/rqlite/rqlite/issues/263).
+
+## 7.17.0 (May 9th 2023)
+### New features
+- [PR #1253](https://github.com/rqlite/rqlite/pull/1253): Node optionally removes itself from the cluster automatically when gracefully shutting down. See the [documentation](https://rqlite.io/docs/clustering/general-guidelines/#removing-a-node-automatically-on-shutdown) for full details.
+
+### Implementation changes and bug fixes
+- [PR #1252](https://github.com/rqlite/rqlite/pull/1252): Stop the HTTP server first on shutdown.
+
+## 7.16.0 (May 5th 2023)
+This release introduces the ability for a node to automatically recover from a backup in AWS S3. See the [documentation](https://rqlite.io/docs/guides/backup/#restoring-from-cloud-storage) for full details.
+### New features
+- [PR #1243](https://github.com/rqlite/rqlite/pull/1243): Support automatically restoring from AWS S3. Thanks to [VOXO](https://voxo.co/) for funding this development.
+- [PR #1244](https://github.com/rqlite/rqlite/pull/1244): Disco configs now support Environment variable expansion.
+- [PR #1245](https://github.com/rqlite/rqlite/pull/1245): Support continuing on failure to download from AWS S3.
+- [PR #1246](https://github.com/rqlite/rqlite/pull/1246): Add support for custom S3 endpoint.
+
+### Implementation changes and bug fixes
+- [PR #1239](https://github.com/rqlite/rqlite/pull/1239): Remove erroneous scaling factor from etcd and Consul reporting service.
+- [PR #1240](https://github.com/rqlite/rqlite/pull/1240): Add support for controlling and reading Store readiness.
+- [PR #1241](https://github.com/rqlite/rqlite/pull/1241): Check Store is ready in key places.
+- [PR #1248](https://github.com/rqlite/rqlite/pull/1248): Refactor autobackup and autorestore.
+- [PR #1249](https://github.com/rqlite/rqlite/pull/1249): Retry certain cluster-client operations.
+
+## 7.15.1 (April 29th 2023)
+### Implementation changes and bug fixes
+- [PR #1233](https://github.com/rqlite/rqlite/pull/1233): Close file handle after upload.
+
+## 7.15.0 (April 28th 2023)
+### New features
+- [PR #1229](https://github.com/rqlite/rqlite/pull/1229), [PR #1232](https://github.com/rqlite/rqlite/pull/1232): Add support for automatic backups to AWS S3. Many thanks to [VOXO](https://voxo.co/) for funding this development.
+
+## 7.14.3 (April 25th 2023)
+### Implementation changes and bug fixes
+- [PR #1218](https://github.com/rqlite/rqlite/pull/1218): Check for more possible errors in peers.json. Thanks @Tjstretchalot
+- [PR #1220](https://github.com/rqlite/rqlite/pull/1220): Support Notify over Raft connection.
+- [PR #1221](https://github.com/rqlite/rqlite/pull/1221): Support Join over Raft connection.
+- [PR #1222](https://github.com/rqlite/rqlite/pull/1222): Joiner expands all targets to include protocols.
+- [PR #1224](https://github.com/rqlite/rqlite/pull/1224): Fix credentials load error checking. Thanks @phmx
+- [PR #1227](https://github.com/rqlite/rqlite/pull/1227): Upgrade dependencies, including moving to [Hashicorp Raft 1.5](https://github.com/hashicorp/raft/pull/541).
+
+## 7.14.2 (April 7th 2023)
+This release is the first to includes various bug fixes and optimizations thanks to running much of the code through [Chat GPT-4](https://openai.com/product/gpt-4), most of which are not explicitly listed in the [CHANGELOG](https://github.com/rqlite/rqlite/edit/master/CHANGELOG.md), but you can check the commit history for details. Future releases of rqlite will probably include more such changes.
+### Implementation changes and bug fixes
+- [PR #1179](https://github.com/rqlite/rqlite/pull/1179): go mod updates.
+- [PR #1180](https://github.com/rqlite/rqlite/pull/1180): Support large numbers in requests.
+- [PR #1186](https://github.com/rqlite/rqlite/pull/1186): Improve read-only (non-voting) node management. Fixes [issue #1182](https://github.com/rqlite/rqlite/issues/1182).
+- [PR #1189](https://github.com/rqlite/rqlite/pull/1189): Migrate to a Protobuf data model for Join Requests.
+- [PR #1190](https://github.com/rqlite/rqlite/pull/1190): Migrate to a Protobuf data model for Notify Requests.
+- [PR #1207](https://github.com/rqlite/rqlite/pull/1207): Decompose end-to-end testing into distinct CircleCI jobs.
+- [PR #1218](https://github.com/rqlite/rqlite/pull/1218): Check for more possible errors in peers.json. Thanks @Tjstretchalot
+
+## 7.14.1 (March 17th 2023)
+### Implementation changes and bug fixes
+- [PR #1174](https://github.com/rqlite/rqlite/pull/1174): Fix command-line help for x509 resources.
+- [PR #1178](https://github.com/rqlite/rqlite/pull/1178): Fix parsing of Named Parameters with `NULL` as value. Fixes [issue #1177](https://github.com/rqlite/rqlite/issues/1177). Thanks @wellescastro
+
+## 7.14.0 (March 8th 2023)
+This release sees the addition of mutual TLS support, and corrects some other issues related to the use of TLS and Certificate Authority configuration.
+
+### New features
+- [PR #1171](https://github.com/rqlite/rqlite/pull/1171): Support mutual TLS for both HTTP connections and inter-node traffic. See [issue #1167](https://github.com/rqlite/rqlite/issues/1167). Thanks @otto-dev
+
+### Implementation changes and bug fixes
+- [PR #1173](https://github.com/rqlite/rqlite/pull/1173): go mod updates.
+
+## 7.13.2 (February 23rd 2023)
 ### Implementation changes and bug fixes
 - [PR #1156](https://github.com/rqlite/rqlite/pull/1156): Better error message when rqlite shell can't connect to a node.
+- [PR #1162](https://github.com/rqlite/rqlite/pull/1162): Fix Consul-based discovery issue when using TLS.
+- [PR #1163](https://github.com/rqlite/rqlite/pull/1163): go mod updates.
 
 ## 7.13.1 (January 6th 2023)
 ### Implementation changes and bug fixes

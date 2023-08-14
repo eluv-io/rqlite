@@ -27,6 +27,10 @@ _test
 # Temporary vim files
 *.swp
 
+# Temporary data files
+cmd/rqlited/data*
+system_test/e2e/__pycache__/
+
 # Notes
 TODO
 

@@ -1,11 +1,14 @@
 package system
 
 import (
+	"crypto/tls"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/rqlite/rqlite/v7/cluster"
 	"github.com/rqlite/rqlite/v7/command"
+	"github.com/rqlite/rqlite/v7/rtls"
 	"github.com/rqlite/rqlite/v7/tcp"
 )
 
@@ -35,74 +38,120 @@ func Test_StoreClientSideBySide(t *testing.T) {
 		t.Fatalf("failed to execute on local: %s", err.Error())
 	}
 	if exp, got := "[{}]", asJSON(res); exp != got {
-		t.Fatalf("unexpected results, expt %s, got %s", exp, got)
+		t.Fatalf("unexpected results, exp %s, got %s", exp, got)
 	}
 	res, err = client.Execute(executeRequestFromString("CREATE TABLE bar (id INTEGER NOT NULL PRIMARY KEY, name TEXT)"), leaderAddr, NO_CREDS, shortWait)
 	if err != nil {
 		t.Fatalf("failed to execute via remote: %s", err.Error())
 	}
 	if exp, got := "[{}]", asJSON(res); exp != got {
-		t.Fatalf("unexpected results, expt %s, got %s", exp, got)
+		t.Fatalf("unexpected results, exp %s, got %s", exp, got)
 	}
 
+	// ==============================================================================
 	res, err = node.Store.Execute(executeRequestFromString(`INSERT INTO foo(name) VALUES("fiona")`))
 	if err != nil {
 		t.Fatalf("failed to execute on local: %s", err.Error())
 	}
 	if exp, got := `[{"last_insert_id":1,"rows_affected":1}]`, asJSON(res); exp != got {
-		t.Fatalf("unexpected results, expt %s, got %s", exp, got)
+		t.Fatalf("unexpected results, exp %s, got %s", exp, got)
 	}
 	res, err = client.Execute(executeRequestFromString(`INSERT INTO bar(name) VALUES("fiona")`), leaderAddr, NO_CREDS, shortWait)
 	if err != nil {
 		t.Fatalf("failed to execute via remote: %s", err.Error())
 	}
 	if exp, got := `[{"last_insert_id":1,"rows_affected":1}]`, asJSON(res); exp != got {
-		t.Fatalf("unexpected results, expt %s, got %s", exp, got)
+		t.Fatalf("unexpected results, exp %s, got %s", exp, got)
 	}
 
+	// ==============================================================================
 	rows, err := node.Store.Query(queryRequestFromString(`SELECT * FROM foo`))
 	if err != nil {
 		t.Fatalf("failed to query on local: %s", err.Error())
 	}
 	if exp, got := `[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"]]}]`, asJSON(rows); exp != got {
-		t.Fatalf("unexpected results, expt %s, got %s", exp, got)
+		t.Fatalf("unexpected results, exp %s, got %s", exp, got)
 	}
-	rows, err = node.Store.Query(queryRequestFromString(`SELECT * FROM bar`))
+	results, err := node.Store.Request(executeQueryRequestFromString(`SELECT * FROM foo`))
 	if err != nil {
-		t.Fatalf("failed to query on local: %s", err.Error())
+		t.Fatalf("failed to request on local: %s", err.Error())
 	}
-	if exp, got := `[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"]]}]`, asJSON(rows); exp != got {
-		t.Fatalf("unexpected results, expt %s, got %s", exp, got)
+	if exp, got := `[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"]]}]`, asJSON(results); exp != got {
+		t.Fatalf("unexpected results, exp %s, got %s", exp, got)
 	}
-
 	rows, err = client.Query(queryRequestFromString(`SELECT * FROM foo`), leaderAddr, NO_CREDS, shortWait)
 	if err != nil {
 		t.Fatalf("failed to query via remote: %s", err.Error())
 	}
 	if exp, got := `[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"]]}]`, asJSON(rows); exp != got {
-		t.Fatalf("unexpected results, expt %s, got %s", exp, got)
+		t.Fatalf("unexpected results, exp %s, got %s", exp, got)
+	}
+	results, err = client.Request(executeQueryRequestFromString(`SELECT * FROM foo`), leaderAddr, NO_CREDS, shortWait)
+	if err != nil {
+		t.Fatalf("failed to query via remote: %s", err.Error())
+	}
+	if exp, got := `[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"]]}]`, asJSON(results); exp != got {
+		t.Fatalf("unexpected results, exp %s, got %s", exp, got)
+	}
+
+	// ==============================================================================
+	rows, err = node.Store.Query(queryRequestFromString(`SELECT * FROM bar`))
+	if err != nil {
+		t.Fatalf("failed to query on local: %s", err.Error())
+	}
+	if exp, got := `[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"]]}]`, asJSON(rows); exp != got {
+		t.Fatalf("unexpected results, exp %s, got %s", exp, got)
+	}
+	results, err = node.Store.Request(executeQueryRequestFromString(`SELECT * FROM bar`))
+	if err != nil {
+		t.Fatalf("failed to request on local: %s", err.Error())
+	}
+	if exp, got := `[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"]]}]`, asJSON(results); exp != got {
+		t.Fatalf("unexpected results, exp %s, got %s", exp, got)
 	}
 	rows, err = client.Query(queryRequestFromString(`SELECT * FROM bar`), leaderAddr, NO_CREDS, shortWait)
 	if err != nil {
 		t.Fatalf("failed to query via remote: %s", err.Error())
 	}
 	if exp, got := `[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"]]}]`, asJSON(rows); exp != got {
-		t.Fatalf("unexpected results, expt %s, got %s", exp, got)
+		t.Fatalf("unexpected results, exp %s, got %s", exp, got)
+	}
+	results, err = client.Request(executeQueryRequestFromString(`SELECT * FROM bar`), leaderAddr, NO_CREDS, shortWait)
+	if err != nil {
+		t.Fatalf("failed to query via remote: %s", err.Error())
+	}
+	if exp, got := `[{"columns":["id","name"],"types":["integer","text"],"values":[[1,"fiona"]]}]`, asJSON(results); exp != got {
+		t.Fatalf("unexpected results, exp %s, got %s", exp, got)
 	}
 
+	// ==============================================================================
 	rows, err = node.Store.Query(queryRequestFromString(`SELECT * FROM qux`))
 	if err != nil {
 		t.Fatalf("failed to query on local: %s", err.Error())
 	}
 	if exp, got := `[{"error":"no such table: qux"}]`, asJSON(rows); exp != got {
-		t.Fatalf("unexpected results, expt %s, got %s", exp, got)
+		t.Fatalf("unexpected results, exp %s, got %s", exp, got)
+	}
+	results, err = node.Store.Request(executeQueryRequestFromString(`SELECT * FROM qux`))
+	if err != nil {
+		t.Fatalf("failed to request on local: %s", err.Error())
+	}
+	if exp, got := `[{"error":"no such table: qux"}]`, asJSON(results); exp != got {
+		t.Fatalf("unexpected results, exp %s, got %s", exp, got)
 	}
 	rows, err = client.Query(queryRequestFromString(`SELECT * FROM qux`), leaderAddr, NO_CREDS, shortWait)
 	if err != nil {
 		t.Fatalf("failed to query via remote: %s", err.Error())
 	}
 	if exp, got := `[{"error":"no such table: qux"}]`, asJSON(rows); exp != got {
-		t.Fatalf("unexpected results, expt %s, got %s", exp, got)
+		t.Fatalf("unexpected results, exp %s, got %s", exp, got)
+	}
+	results, err = client.Request(executeQueryRequestFromString(`SELECT * FROM qux`), leaderAddr, NO_CREDS, shortWait)
+	if err != nil {
+		t.Fatalf("failed to query via remote: %s", err.Error())
+	}
+	if exp, got := `[{"error":"no such table: qux"}]`, asJSON(results); exp != got {
+		t.Fatalf("unexpected results, exp %s, got %s", exp, got)
 	}
 }
 
@@ -170,7 +219,7 @@ func Test_MultiNodeClusterRequestForwardOK(t *testing.T) {
 		t.Fatalf("got incorrect response from follower exp: %s, got: %s", exp, got)
 	}
 
-	res, err = leader.Execute(`INSERT INTO foo(name) VALUES("fiona")`)
+	res, err = followers[1].Request(`INSERT INTO foo(name) VALUES("fiona")`)
 	if err != nil {
 		t.Fatalf("failed to create table: %s", err.Error())
 	}
@@ -178,11 +227,19 @@ func Test_MultiNodeClusterRequestForwardOK(t *testing.T) {
 		t.Fatalf("got incorrect response from follower exp: %s, got: %s", exp, got)
 	}
 
+	res, err = leader.Execute(`INSERT INTO foo(name) VALUES("fiona")`)
+	if err != nil {
+		t.Fatalf("failed to create table: %s", err.Error())
+	}
+	if exp, got := `{"results":[{"last_insert_id":3,"rows_affected":1}]}`, res; exp != got {
+		t.Fatalf("got incorrect response from follower exp: %s, got: %s", exp, got)
+	}
+
 	rows, err := followers[0].Query(`SELECT COUNT(*) FROM foo`)
 	if err != nil {
 		t.Fatalf("failed to create table: %s", err.Error())
 	}
-	if exp, got := `{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[2]]}]}`, rows; exp != got {
+	if exp, got := `{"results":[{"columns":["COUNT(*)"],"types":["integer"],"values":[[3]]}]}`, rows; exp != got {
 		t.Fatalf("got incorrect response from follower exp: %s, got: %s", exp, got)
 	}
 }
@@ -222,7 +279,7 @@ func Test_MultiNodeClusterQueuedRequestForwardOK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to query for count: %s", err.Error())
 	}
-	if exp, got := `{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[0]]}]}`, rows; exp != got {
+	if exp, got := `{"results":[{"columns":["COUNT(*)"],"types":["integer"],"values":[[0]]}]}`, rows; exp != got {
 		t.Fatalf("got incorrect response from follower exp: %s, got: %s", exp, got)
 	}
 
@@ -234,7 +291,7 @@ func Test_MultiNodeClusterQueuedRequestForwardOK(t *testing.T) {
 	if len(followers) != 1 {
 		t.Fatalf("got incorrect number of followers: %d", len(followers))
 	}
-	res, err = followers[0].ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, false)
+	_, err = followers[0].ExecuteQueued(`INSERT INTO foo(name) VALUES("fiona")`, false)
 	if err != nil {
 		t.Fatalf("failed to insert record: %s", err.Error())
 	}
@@ -248,7 +305,7 @@ func Test_MultiNodeClusterQueuedRequestForwardOK(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to query for count: %s", err.Error())
 			}
-			if r == `{"results":[{"columns":["COUNT(*)"],"types":[""],"values":[[1]]}]}` {
+			if r == `{"results":[{"columns":["COUNT(*)"],"types":["integer"],"values":[[1]]}]}` {
 				return
 			}
 		case <-timer.C:
@@ -299,6 +356,35 @@ func queryRequestFromStrings(s []string) *command.QueryRequest {
 	}
 }
 
+func executeQueryRequestFromString(s string) *command.ExecuteQueryRequest {
+	return executeQueryRequestFromStrings([]string{s})
+}
+
+// executeQueryRequestFromStrings converts a slice of strings into a command.ExecuteQueryRequest
+func executeQueryRequestFromStrings(s []string) *command.ExecuteQueryRequest {
+	stmts := make([]*command.Statement, len(s))
+	for i := range s {
+		stmts[i] = &command.Statement{
+			Sql: s[i],
+		}
+	}
+	return &command.ExecuteQueryRequest{
+		Request: &command.Request{
+			Statements:  stmts,
+			Transaction: false,
+		},
+		Timings: false,
+	}
+}
+
 func mustNewDialer(header byte, remoteEncrypted, skipVerify bool) *tcp.Dialer {
-	return tcp.NewDialer(header, remoteEncrypted, skipVerify)
+	var tlsConfig *tls.Config
+	var err error
+	if remoteEncrypted {
+		tlsConfig, err = rtls.CreateClientConfig("", "", "", skipVerify, false)
+		if err != nil {
+			panic(fmt.Sprintf("failed to create client TLS config: %s", err))
+		}
+	}
+	return tcp.NewDialer(header, tlsConfig)
 }

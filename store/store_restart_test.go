@@ -141,7 +141,7 @@ func openStoreCloseStartup(t *testing.T, s *Store) {
 	if err != nil {
 		t.Fatalf("failed to query single node: %s", err.Error())
 	}
-	if exp, got := `[{"columns":["COUNT(*)"],"types":[""],"values":[[10]]}]`, asJSON(r); exp != got {
+	if exp, got := `[{"columns":["COUNT(*)"],"types":["integer"],"values":[[10]]}]`, asJSON(r); exp != got {
 		t.Fatalf("unexpected results for query\nexp: %s\ngot: %s", exp, got)
 	}
 
@@ -169,7 +169,7 @@ func openStoreCloseStartup(t *testing.T, s *Store) {
 	if err != nil {
 		t.Fatalf("failed to query single node: %s", err.Error())
 	}
-	if exp, got := `[{"columns":["COUNT(*)"],"types":[""],"values":[[11]]}]`, asJSON(r); exp != got {
+	if exp, got := `[{"columns":["COUNT(*)"],"types":["integer"],"values":[[11]]}]`, asJSON(r); exp != got {
 		t.Fatalf("unexpected results for query\nexp: %s\ngot: %s", exp, got)
 	}
 
@@ -201,26 +201,15 @@ func openStoreCloseStartup(t *testing.T, s *Store) {
 	if err != nil {
 		t.Fatalf("failed to query single node: %s", err.Error())
 	}
-	if exp, got := `[{"columns":["COUNT(*)"],"types":[""],"values":[[11]]}]`, asJSON(r); exp != got {
+	if exp, got := `[{"columns":["COUNT(*)"],"types":["integer"],"values":[[11]]}]`, asJSON(r); exp != got {
 		t.Fatalf("unexpected results for query\nexp: %s\ngot: %s", exp, got)
 	}
 }
 
-// Test_OpenStoreCloseStartupOnDiskSingleNode tests that the on-disk
-// optimization can be disabled in various scenarios.
+// Test_OpenStoreCloseStartupOnDiskSingleNode tests that on-disk
+// works fine during various restart scenarios.
 func Test_OpenStoreCloseStartupOnDiskSingleNode(t *testing.T) {
 	s, ln := mustNewStore(t, false)
-	s.StartupOnDisk = true
-	defer ln.Close()
-
-	openStoreCloseStartup(t, s)
-}
-
-// Test_OpenStoreCloseStartupMemorySingleNode tests that the on-disk
-// optimization works fine.
-func Test_OpenStoreCloseStartupMemorySingleNode(t *testing.T) {
-	s, ln := mustNewStore(t, false)
-	s.StartupOnDisk = false
 	defer ln.Close()
 
 	openStoreCloseStartup(t, s)

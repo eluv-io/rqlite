@@ -3,6 +3,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"expvar"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -18,18 +20,27 @@ import (
 	"github.com/rqlite/rqlite/v7/command"
 )
 
-const bkDelay = 250
+const (
+	bkDelay                  = 250
+	defaultCheckpointTimeout = 30 * time.Second
+)
 
 const (
-	onDiskMaxOpenConns = 32
-	onDiskMaxIdleTime  = 120 * time.Second
+	numCheckpoints      = "checkpoints"
+	numCheckpointErrors = "checkpoint_errors"
+	checkpointDuration  = "checkpoint_duration_ns"
+	numExecutions       = "executions"
+	numExecutionErrors  = "execution_errors"
+	numQueries          = "queries"
+	numQueryErrors      = "query_errors"
+	numRequests         = "requests"
+	numETx              = "execute_transactions"
+	numQTx              = "query_transactions"
+	numRTx              = "request_transactions"
+)
 
-	numExecutions      = "executions"
-	numExecutionErrors = "execution_errors"
-	numQueries         = "queries"
-	numQueryErrors     = "query_errors"
-	numETx             = "execute_transactions"
-	numQTx             = "query_transactions"
+var (
+	ErrWALReplayDirectoryMismatch = fmt.Errorf("WAL file(s) not in same directory as database file")
 )
 
 // DBVersion is the SQLite version.
@@ -48,19 +59,26 @@ func init() {
 // ResetStats resets the expvar stats for this module. Mostly for test purposes.
 func ResetStats() {
 	stats.Init()
+	stats.Add(numCheckpoints, 0)
+	stats.Add(numCheckpointErrors, 0)
+	stats.Add(checkpointDuration, 0)
 	stats.Add(numExecutions, 0)
 	stats.Add(numExecutionErrors, 0)
 	stats.Add(numQueries, 0)
 	stats.Add(numQueryErrors, 0)
+	stats.Add(numRequests, 0)
 	stats.Add(numETx, 0)
 	stats.Add(numQTx, 0)
+	stats.Add(numRTx, 0)
 }
 
 // DB is the SQL database.
 type DB struct {
 	path      string // Path to database file, if running on-disk.
+	walPath   string // Path to WAL file, if running on-disk and WAL is enabled.
 	memory    bool   // In-memory only.
 	fkEnabled bool   // Foreign key constraints enabled
+	wal       bool
 
 	rwDB *sql.DB // Database connection for database reads and writes.
 	roDB *sql.DB // Database connection database reads.
@@ -82,13 +100,189 @@ type PoolStats struct {
 	MaxLifetimeClosed  int64         `json:"max_lifetime_closed"`
 }
 
+// IsValidSQLiteFile checks that the supplied path looks like a SQLite file.
+func IsValidSQLiteFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	b := make([]byte, 16)
+	if _, err := f.Read(b); err != nil {
+		return false
+	}
+
+	return IsValidSQLiteData(b)
+}
+
+// IsValidSQLiteData checks that the supplied data looks like a SQLite data.
+// See https://www.sqlite.org/fileformat.html
+func IsValidSQLiteData(b []byte) bool {
+	return len(b) > 13 && string(b[0:13]) == "SQLite format"
+}
+
+// IsValidSQLiteWALFile checks that the supplied path looks like a SQLite
+// WAL file. See https://www.sqlite.org/fileformat2.html#walformat
+func IsValidSQLiteWALFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	b := make([]byte, 4)
+	if _, err := f.Read(b); err != nil {
+		return false
+	}
+
+	return IsValidSQLiteWALData(b)
+}
+
+// IsValidSQLiteWALFile checks that the supplied data looks like a SQLite
+// WAL file.
+func IsValidSQLiteWALData(b []byte) bool {
+	if len(b) < 4 {
+		return false
+	}
+
+	header1 := []byte{0x37, 0x7f, 0x06, 0x82}
+	header2 := []byte{0x37, 0x7f, 0x06, 0x83}
+	header := b[:4]
+	return bytes.Equal(header, header1) || bytes.Equal(header, header2)
+}
+
+// IsWALModeEnabledSQLiteFile checks that the supplied path looks like a SQLite
+// with WAL mode enabled.
+func IsWALModeEnabledSQLiteFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	b := make([]byte, 20)
+	if _, err := f.Read(b); err != nil {
+		return false
+	}
+
+	return IsWALModeEnabled(b)
+}
+
+// IsWALModeEnabled checks that the supplied data looks like a SQLite data
+// with WAL mode enabled.
+func IsWALModeEnabled(b []byte) bool {
+	return len(b) >= 20 && b[18] == 2 && b[19] == 2
+}
+
+// IsDELETEModeEnabledSQLiteFile checks that the supplied path looks like a SQLite
+// with DELETE mode enabled.
+func IsDELETEModeEnabledSQLiteFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	b := make([]byte, 20)
+	if _, err := f.Read(b); err != nil {
+		return false
+	}
+
+	return IsDELETEModeEnabled(b)
+}
+
+// IsDELETEModeEnabledSQLiteFile checks that the supplied path looks like a SQLite
+// with DELETE mode enabled.
+func IsDELETEModeEnabled(b []byte) bool {
+	return len(b) >= 20 && b[18] == 1 && b[19] == 1
+}
+
+// RemoveFiles removes the SQLite database file, and any associated WAL and SHM files.
+func RemoveFiles(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Remove(path + "-wal"); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Remove(path + "-shm"); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// ReplayWAL replays the given WAL files into the database at the given path,
+// in the order given by the slice. The supplied WAL files must be in the same
+// directory as the database file and are removed as a result of the replay operation.
+// The "real" WAL file is also removed. If deleteMode is true, the database file
+// will be in DELETE mode after the replay operation, otherwise it will be in WAL
+// mode.
+func ReplayWAL(path string, wals []string, deleteMode bool) error {
+	for _, wal := range wals {
+		if filepath.Dir(wal) != filepath.Dir(path) {
+			return ErrWALReplayDirectoryMismatch
+		}
+	}
+
+	if !IsValidSQLiteFile(path) {
+		return fmt.Errorf("invalid database file %s", path)
+	}
+
+	for _, wal := range wals {
+		if !IsValidSQLiteWALFile(wal) {
+			return fmt.Errorf("invalid WAL file %s", wal)
+		}
+		if err := os.Rename(wal, path+"-wal"); err != nil {
+			return fmt.Errorf("rename WAL %s: %s", wal, err.Error())
+		}
+		db, err := Open(path, false, true)
+		if err != nil {
+			return err
+		}
+		if err := db.Checkpoint(defaultCheckpointTimeout); err != nil {
+			return fmt.Errorf("checkpoint WAL %s: %s", wal, err.Error())
+		}
+		if err := db.Close(); err != nil {
+			return err
+		}
+	}
+
+	if deleteMode {
+		db, err := Open(path, false, false)
+		if err != nil {
+			return err
+		}
+		if db.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Open opens a file-based database, creating it if it does not exist. After this
 // function returns, an actual SQLite file will always exist.
-func Open(dbPath string, fkEnabled bool) (*DB, error) {
+func Open(dbPath string, fkEnabled, wal bool) (*DB, error) {
 	rwDSN := fmt.Sprintf("file:%s?_fk=%s", dbPath, strconv.FormatBool(fkEnabled))
 	rwDB, err := sql.Open("sqlite3", rwDSN)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open: %s", err.Error())
+	}
+
+	// Set synchronous to OFF, to improve performance. The SQLite docs state that
+	// this risks database corruption in the event of a crash, but that's OK, as
+	// rqlite blows away the database on startup and always rebuilds it from the
+	// Raft log.
+	if _, err := rwDB.Exec("PRAGMA synchronous=OFF"); err != nil {
+		return nil, fmt.Errorf("sync OFF: %s", err.Error())
+	}
+
+	mode := "WAL"
+	if !wal {
+		mode = "DELETE"
+	}
+	if _, err := rwDB.Exec(fmt.Sprintf("PRAGMA journal_mode=%s", mode)); err != nil {
+		return nil, fmt.Errorf("journal mode to %s: %s", mode, err.Error())
 	}
 
 	roOpts := []string{
@@ -115,7 +309,9 @@ func Open(dbPath string, fkEnabled bool) (*DB, error) {
 
 	return &DB{
 		path:      dbPath,
+		walPath:   dbPath + "-wal",
 		fkEnabled: fkEnabled,
+		wal:       wal,
 		rwDB:      rwDB,
 		roDB:      roDB,
 		rwDSN:     rwDSN,
@@ -179,13 +375,13 @@ func OpenInMemory(fkEnabled bool) (*DB, error) {
 // LoadIntoMemory loads an in-memory database with that at the path.
 // Not safe to call while other operations are happening with the
 // source database.
-func LoadIntoMemory(dbPath string, fkEnabled bool) (*DB, error) {
+func LoadIntoMemory(dbPath string, fkEnabled, wal bool) (*DB, error) {
 	dstDB, err := OpenInMemory(fkEnabled)
 	if err != nil {
 		return nil, err
 	}
 
-	srcDB, err := Open(dbPath, false)
+	srcDB, err := Open(dbPath, fkEnabled, wal)
 	if err != nil {
 		return nil, err
 	}
@@ -234,14 +430,14 @@ func DeserializeIntoMemory(b []byte, fkEnabled bool) (retDB *DB, retErr error) {
 		srcConn := driverConn.(*sqlite3.SQLiteConn)
 		err2 := srcConn.Deserialize(b, "")
 		if err2 != nil {
-			return fmt.Errorf("DeserializeIntoMemory: %s", err.Error())
+			return fmt.Errorf("DeserializeIntoMemory: %s", err2.Error())
 		}
 		defer srcConn.Close()
 
 		// Now copy from tmp database to the database this function will return.
 		dbConn, err3 := retDB.rwDB.Conn(context.Background())
 		if err3 != nil {
-			return fmt.Errorf("DeserializeIntoMemory: %s", err.Error())
+			return fmt.Errorf("DeserializeIntoMemory: %s", err3.Error())
 		}
 		defer dbConn.Close()
 
@@ -283,6 +479,10 @@ func (db *DB) Stats() (map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
+	pragmas, err := db.pragmas()
+	if err != nil {
+		return nil, err
+	}
 	stats := map[string]interface{}{
 		"version":         DBVersion,
 		"compile_options": copts,
@@ -291,12 +491,18 @@ func (db *DB) Stats() (map[string]interface{}, error) {
 		"rw_dsn":          db.rwDSN,
 		"ro_dsn":          db.roDSN,
 		"conn_pool_stats": connPoolStats,
+		"pragmas":         pragmas,
 	}
 
 	stats["path"] = db.path
 	if !db.memory {
 		if stats["size"], err = db.FileSize(); err != nil {
 			return nil, err
+		}
+		if db.wal {
+			if stats["wal_size"], err = db.WALSize(); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return stats, nil
@@ -308,6 +514,9 @@ func (db *DB) Size() (int64, error) {
 	rows, err := db.QueryStringStmt(`SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()`)
 	if err != nil {
 		return 0, err
+	}
+	if rows[0].Error != "" {
+		return 0, fmt.Errorf(rows[0].Error)
 	}
 
 	return rows[0].Values[0].Parameters[0].GetI(), nil
@@ -326,6 +535,84 @@ func (db *DB) FileSize() (int64, error) {
 	return fi.Size(), nil
 }
 
+// WALSize returns the size of the SQLite WAL file on disk. If running in
+// WAL mode is not enabled, this function returns 0.
+func (db *DB) WALSize() (int64, error) {
+	if !db.wal {
+		return 0, nil
+	}
+	fi, err := os.Stat(db.walPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return 0, err
+		}
+		return 0, nil
+	}
+	return fi.Size(), nil
+}
+
+// Checkpoint performs a WAL checkpoint. If the checkpoint does not complete
+// within the given duration, an error is returned.
+func (db *DB) Checkpoint(dur time.Duration) (err error) {
+	start := time.Now()
+	defer func() {
+		if err != nil {
+			stats.Add(numCheckpointErrors, 1)
+		} else {
+			stats.Get(checkpointDuration).(*expvar.Int).Set(time.Since(start).Nanoseconds())
+			stats.Add(numCheckpoints, 1)
+		}
+	}()
+
+	var ok int
+	var nPages int
+	var nMoved int
+
+	f := func() error {
+		err := db.rwDB.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&ok, &nPages, &nMoved)
+		if err != nil {
+			return err
+		}
+		if ok != 0 {
+			return fmt.Errorf("failed to completely checkpoint WAL")
+		}
+		return nil
+	}
+
+	// Try fast path
+	if err := f(); err == nil {
+		return nil
+	}
+
+	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			if err := f(); err == nil {
+				return nil
+			}
+		case <-time.After(dur):
+			return fmt.Errorf("checkpoint timeout")
+		}
+	}
+}
+
+// DisableCheckpoint disables the automatic checkpointing that occurs when
+// the WAL reaches a certain size. This is key for full control of snapshotting.
+// and can be useful for testing.
+func (db *DB) DisableCheckpointing() error {
+	_, err := db.rwDB.Exec("PRAGMA wal_autocheckpoint=-1")
+	return err
+}
+
+// EnableCheckpointing enables the automatic checkpointing that occurs when
+// the WAL reaches a certain size.
+func (db *DB) EnableCheckpointing() error {
+	_, err := db.rwDB.Exec("PRAGMA wal_autocheckpoint=1000")
+	return err
+}
+
 // InMemory returns whether this database is in-memory.
 func (db *DB) InMemory() bool {
 	return db.memory
@@ -334,6 +621,11 @@ func (db *DB) InMemory() bool {
 // FKEnabled returns whether Foreign Key constraints are enabled.
 func (db *DB) FKEnabled() bool {
 	return db.fkEnabled
+}
+
+// WALEnabled returns whether WAL mode is enabled.
+func (db *DB) WALEnabled() bool {
+	return db.wal
 }
 
 // Path returns the path of this database.
@@ -394,18 +686,22 @@ func (db *DB) ExecuteStringStmt(query string) ([]*command.ExecuteResult, error) 
 // Execute executes queries that modify the database.
 func (db *DB) Execute(req *command.Request, xTime bool) ([]*command.ExecuteResult, error) {
 	stats.Add(numExecutions, int64(len(req.Statements)))
-
 	conn, err := db.rwDB.Conn(context.Background())
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
+	return db.executeWithConn(req, xTime, conn)
+}
 
-	type Execer interface {
-		ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
-	}
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+}
 
-	var execer Execer
+func (db *DB) executeWithConn(req *command.Request, xTime bool, conn *sql.Conn) ([]*command.ExecuteResult, error) {
+	var err error
+
+	var execer execer
 	var tx *sql.Tx
 	if req.Transaction {
 		stats.Add(numETx, 1)
@@ -446,48 +742,12 @@ func (db *DB) Execute(req *command.Request, xTime bool) ([]*command.ExecuteResul
 			continue
 		}
 
-		result := &command.ExecuteResult{}
-		start := time.Now()
-
-		parameters, err := parametersToValues(stmt.Parameters)
+		result, err := db.executeStmtWithConn(stmt, xTime, execer)
 		if err != nil {
 			if handleError(result, err) {
 				continue
 			}
 			break
-		}
-
-		r, err := execer.ExecContext(context.Background(), ss, parameters...)
-		if err != nil {
-			if handleError(result, err) {
-				continue
-			}
-			break
-		}
-
-		if r == nil {
-			continue
-		}
-
-		lid, err := r.LastInsertId()
-		if err != nil {
-			if handleError(result, err) {
-				continue
-			}
-			break
-		}
-		result.LastInsertId = lid
-
-		ra, err := r.RowsAffected()
-		if err != nil {
-			if handleError(result, err) {
-				continue
-			}
-			break
-		}
-		result.RowsAffected = ra
-		if xTime {
-			result.Time = time.Now().Sub(start).Seconds()
 		}
 		allResults = append(allResults, result)
 	}
@@ -496,6 +756,45 @@ func (db *DB) Execute(req *command.Request, xTime bool) ([]*command.ExecuteResul
 		err = tx.Commit()
 	}
 	return allResults, err
+}
+
+func (db *DB) executeStmtWithConn(stmt *command.Statement, xTime bool, e execer) (*command.ExecuteResult, error) {
+	result := &command.ExecuteResult{}
+	start := time.Now()
+
+	parameters, err := parametersToValues(stmt.Parameters)
+	if err != nil {
+		result.Error = err.Error()
+		return result, nil
+	}
+
+	r, err := e.ExecContext(context.Background(), stmt.Sql, parameters...)
+	if err != nil {
+		result.Error = err.Error()
+		return result, err
+	}
+
+	if r == nil {
+		return result, nil
+	}
+
+	lid, err := r.LastInsertId()
+	if err != nil {
+		result.Error = err.Error()
+		return result, err
+	}
+	result.LastInsertId = lid
+
+	ra, err := r.RowsAffected()
+	if err != nil {
+		result.Error = err.Error()
+		return result, err
+	}
+	result.RowsAffected = ra
+	if xTime {
+		result.Time = time.Since(start).Seconds()
+	}
+	return result, nil
 }
 
 // QueryStringStmt executes a single query that return rows, but don't modify database.
@@ -521,13 +820,14 @@ func (db *DB) Query(req *command.Request, xTime bool) ([]*command.QueryRows, err
 	return db.queryWithConn(req, xTime, conn)
 }
 
+type queryer interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+}
+
 func (db *DB) queryWithConn(req *command.Request, xTime bool, conn *sql.Conn) ([]*command.QueryRows, error) {
 	var err error
-	type Queryer interface {
-		QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
-	}
 
-	var queryer Queryer
+	var queryer queryer
 	var tx *sql.Tx
 	if req.Transaction {
 		stats.Add(numQTx, 1)
@@ -548,100 +848,34 @@ func (db *DB) queryWithConn(req *command.Request, xTime bool, conn *sql.Conn) ([
 			continue
 		}
 
-		rows := &command.QueryRows{}
-		start := time.Now()
+		var rows *command.QueryRows
+		var err error
 
-		// Do best-effort check that the statement won't try to change
-		// the database. As per the SQLite documentation, this will not
-		// cover 100% of possibilities, but should cover most.
-		var readOnly bool
-		f := func(driverConn interface{}) error {
-			c := driverConn.(*sqlite3.SQLiteConn)
-			drvStmt, err := c.Prepare(sql)
-			if err != nil {
-				return err
-			}
-			defer drvStmt.Close()
-			sqliteStmt := drvStmt.(*sqlite3.SQLiteStmt)
-			readOnly = sqliteStmt.Readonly()
-			return nil
-		}
-		if err := conn.Raw(f); err != nil {
+		readOnly, err := db.StmtReadOnlyWithConn(sql, conn)
+		if err != nil {
 			stats.Add(numQueryErrors, 1)
-			rows.Error = err.Error()
+			rows = &command.QueryRows{
+				Error: err.Error(),
+			}
 			allRows = append(allRows, rows)
 			continue
 		}
 		if !readOnly {
 			stats.Add(numQueryErrors, 1)
-			rows.Error = "attempt to change database via query operation"
+			rows = &command.QueryRows{
+				Error: "attempt to change database via query operation",
+			}
 			allRows = append(allRows, rows)
 			continue
 		}
 
-		parameters, err := parametersToValues(stmt.Parameters)
+		rows, err = db.queryStmtWithConn(stmt, xTime, queryer)
 		if err != nil {
 			stats.Add(numQueryErrors, 1)
-			rows.Error = err.Error()
-			allRows = append(allRows, rows)
-			continue
-		}
-
-		rs, err := queryer.QueryContext(context.Background(), sql, parameters...)
-		if err != nil {
-			stats.Add(numQueryErrors, 1)
-			rows.Error = err.Error()
-			allRows = append(allRows, rows)
-			continue
-		}
-		defer rs.Close()
-
-		columns, err := rs.Columns()
-		if err != nil {
-			return nil, err
-		}
-
-		types, err := rs.ColumnTypes()
-		if err != nil {
-			return nil, err
-		}
-		xTypes := make([]string, len(types))
-		for i := range types {
-			xTypes[i] = strings.ToLower(types[i].DatabaseTypeName())
-		}
-
-		for rs.Next() {
-			dest := make([]interface{}, len(columns))
-			ptrs := make([]interface{}, len(dest))
-			for i := range ptrs {
-				ptrs[i] = &dest[i]
+			rows = &command.QueryRows{
+				Error: err.Error(),
 			}
-			if err := rs.Scan(ptrs...); err != nil {
-				return nil, err
-			}
-			params, err := normalizeRowValues(dest, xTypes)
-			if err != nil {
-				return nil, err
-			}
-			rows.Values = append(rows.Values, &command.Values{
-				Parameters: params,
-			})
 		}
-
-		// Check for errors from iterating over rows.
-		if err := rs.Err(); err != nil {
-			stats.Add(numQueryErrors, 1)
-			rows.Error = err.Error()
-			allRows = append(allRows, rows)
-			continue
-		}
-
-		if xTime {
-			rows.Time = time.Now().Sub(start).Seconds()
-		}
-
-		rows.Columns = columns
-		rows.Types = xTypes
 		allRows = append(allRows, rows)
 	}
 
@@ -651,41 +885,235 @@ func (db *DB) queryWithConn(req *command.Request, xTime bool, conn *sql.Conn) ([
 	return allRows, err
 }
 
+func (db *DB) queryStmtWithConn(stmt *command.Statement, xTime bool, q queryer) (*command.QueryRows, error) {
+	rows := &command.QueryRows{}
+	start := time.Now()
+
+	parameters, err := parametersToValues(stmt.Parameters)
+	if err != nil {
+		stats.Add(numQueryErrors, 1)
+		rows.Error = err.Error()
+		return rows, nil
+	}
+
+	rs, err := q.QueryContext(context.Background(), stmt.Sql, parameters...)
+	if err != nil {
+		stats.Add(numQueryErrors, 1)
+		rows.Error = err.Error()
+		return rows, nil
+	}
+	defer rs.Close()
+
+	columns, err := rs.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	types, err := rs.ColumnTypes()
+	if err != nil {
+		return nil, err
+	}
+	xTypes := make([]string, len(types))
+	for i := range types {
+		xTypes[i] = strings.ToLower(types[i].DatabaseTypeName())
+	}
+	needsQueryTypes := containsEmptyType(xTypes)
+
+	for rs.Next() {
+		dest := make([]interface{}, len(columns))
+		ptrs := make([]interface{}, len(dest))
+		for i := range ptrs {
+			ptrs[i] = &dest[i]
+		}
+		if err := rs.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		params, err := normalizeRowValues(dest, xTypes)
+		if err != nil {
+			return nil, err
+		}
+		rows.Values = append(rows.Values, &command.Values{
+			Parameters: params,
+		})
+
+		// One-time population of any empty types. Best effort, ignore
+		// error.
+		if needsQueryTypes {
+			populateEmptyTypes(xTypes, params)
+			needsQueryTypes = false
+		}
+	}
+
+	// Check for errors from iterating over rows.
+	if err := rs.Err(); err != nil {
+		stats.Add(numQueryErrors, 1)
+		rows.Error = err.Error()
+		return rows, nil
+	}
+
+	if xTime {
+		rows.Time = time.Since(start).Seconds()
+	}
+
+	rows.Columns = columns
+	rows.Types = xTypes
+	return rows, nil
+}
+
+// RequestStringStmts processes a request that can contain both executes and queries.
+func (db *DB) RequestStringStmts(stmts []string) ([]*command.ExecuteQueryResponse, error) {
+	req := &command.Request{}
+	for _, q := range stmts {
+		req.Statements = append(req.Statements, &command.Statement{
+			Sql: q,
+		})
+	}
+	return db.Request(req, false)
+}
+
+// Request processes a request that can contain both executes and queries.
+func (db *DB) Request(req *command.Request, xTime bool) ([]*command.ExecuteQueryResponse, error) {
+	stats.Add(numRequests, int64(len(req.Statements)))
+	conn, err := db.rwDB.Conn(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	var queryer queryer
+	var execer execer
+	var tx *sql.Tx
+	if req.Transaction {
+		stats.Add(numRTx, 1)
+		tx, err = conn.BeginTx(context.Background(), nil)
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback() // Will be ignored if tx is committed
+		queryer = tx
+		execer = tx
+	} else {
+		queryer = conn
+		execer = conn
+	}
+
+	// abortOnError indicates whether the caller should continue
+	// processing or break.
+	abortOnError := func(err error) bool {
+		if err != nil && tx != nil {
+			tx.Rollback()
+			tx = nil
+			return true
+		}
+		return false
+	}
+
+	var eqResponse []*command.ExecuteQueryResponse
+	for _, stmt := range req.Statements {
+		ss := stmt.Sql
+		if ss == "" {
+			continue
+		}
+
+		ro, err := db.StmtReadOnlyWithConn(ss, conn)
+		if err != nil {
+			eqResponse = append(eqResponse, &command.ExecuteQueryResponse{
+				Result: &command.ExecuteQueryResponse_Error{
+					Error: err.Error(),
+				},
+			})
+			continue
+		}
+
+		if ro || stmt.Returning {
+			rows, opErr := db.queryStmtWithConn(stmt, xTime, queryer)
+			eqResponse = append(eqResponse, createEQQueryResponse(rows, opErr))
+			if abortOnError(opErr) {
+				break
+			}
+		} else {
+			result, opErr := db.executeStmtWithConn(stmt, xTime, execer)
+			eqResponse = append(eqResponse, createEQExecuteResponse(result, opErr))
+			if abortOnError(opErr) {
+				break
+			}
+		}
+	}
+
+	if tx != nil {
+		err = tx.Commit()
+	}
+	return eqResponse, err
+}
+
 // Backup writes a consistent snapshot of the database to the given file.
-// This function can be called when changes to the database are in flight.
+// The resultant SQLite database file will be in DELETE mode. This function
+// can be called when changes to the database are in flight.
 func (db *DB) Backup(path string) error {
-	dstDB, err := Open(path, false)
+	dstDB, err := Open(path, false, false)
 	if err != nil {
 		return err
 	}
+	defer dstDB.Close()
 
 	if err := copyDatabase(dstDB, db); err != nil {
 		return fmt.Errorf("backup database: %s", err)
 	}
-	return nil
+
+	// Source database might be in WAL mode.
+	_, err = dstDB.ExecuteStringStmt("PRAGMA journal_mode=DELETE")
+	if err != nil {
+		return err
+	}
+
+	return dstDB.Close()
 }
 
 // Copy copies the contents of the database to the given database. All other
 // attributes of the given database remain untouched e.g. whether it's an
-// on-disk database. This function can be called when changes to the source
-// database are in flight.
+// on-disk database, except the database will be placed in DELETE mode.
+// This function can be called when changes to the source database are in flight.
 func (db *DB) Copy(dstDB *DB) error {
 	if err := copyDatabase(dstDB, db); err != nil {
 		return fmt.Errorf("copy database: %s", err)
 	}
-	return nil
+	_, err := dstDB.ExecuteStringStmt("PRAGMA journal_mode=DELETE")
+	return err
 }
 
 // Serialize returns a byte slice representation of the SQLite database. For
 // an ordinary on-disk database file, the serialization is just a copy of the
 // disk file. For an in-memory database or a "TEMP" database, the serialization
 // is the same sequence of bytes which would be written to disk if that database
-// were backed up to disk. This function must not be called while any writes
-// are happening to the database.
+// were backed up to disk. If the database is in WAL mode, a temporary on-disk
+// copy is made, and it is this copy that is serialized. This function must not
+// be called while any writes are happening to the database.
 func (db *DB) Serialize() ([]byte, error) {
 	if !db.memory {
+		if db.wal {
+			tmpFile, err := os.CreateTemp("", "rqlite-serialize")
+			if err != nil {
+				return nil, err
+			}
+			defer os.Remove(tmpFile.Name())
+			defer tmpFile.Close()
+
+			if err := db.Backup(tmpFile.Name()); err != nil {
+				return nil, err
+			}
+			newDB, err := Open(tmpFile.Name(), db.fkEnabled, false)
+			if err != nil {
+				return nil, err
+			}
+			defer newDB.Close()
+			return newDB.Serialize()
+		}
 		// Simply read and return the SQLite file.
-		return os.ReadFile(db.path)
+		b, err := os.ReadFile(db.path)
+		if err != nil {
+			return nil, err
+		}
+		return b, nil
 	}
 
 	conn, err := db.roDB.Conn(context.Background())
@@ -805,6 +1233,67 @@ func (db *DB) Dump(w io.Writer) error {
 	return nil
 }
 
+// StmtReadOnly returns whether the given SQL statement is read-only.
+// As per https://www.sqlite.org/c3ref/stmt_readonly.html, this function
+// may not return 100% correct results, but should cover most scenarios.
+func (db *DB) StmtReadOnly(sql string) (bool, error) {
+	conn, err := db.roDB.Conn(context.Background())
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+	return db.StmtReadOnlyWithConn(sql, conn)
+}
+
+// StmtReadOnlyWithConn returns whether the given SQL statement is read-only, using
+// the given connection.
+func (db *DB) StmtReadOnlyWithConn(sql string, conn *sql.Conn) (bool, error) {
+	var readOnly bool
+	f := func(driverConn interface{}) error {
+		c := driverConn.(*sqlite3.SQLiteConn)
+		drvStmt, err := c.Prepare(sql)
+		if err != nil {
+			return err
+		}
+		defer drvStmt.Close()
+		sqliteStmt := drvStmt.(*sqlite3.SQLiteStmt)
+		readOnly = sqliteStmt.Readonly()
+		return nil
+	}
+
+	if err := conn.Raw(f); err != nil {
+		return false, err
+	}
+	return readOnly, nil
+}
+
+func (db *DB) pragmas() (map[string]interface{}, error) {
+	conns := map[string]*sql.DB{
+		"rw": db.rwDB,
+		"ro": db.roDB,
+	}
+
+	connsMap := make(map[string]interface{})
+	for k, v := range conns {
+		pragmasMap := make(map[string]string)
+		for _, p := range []string{
+			"synchronous",
+			"journal_mode",
+			"foreign_keys",
+			"wal_autocheckpoint",
+		} {
+			var s string
+			if err := v.QueryRow(fmt.Sprintf("PRAGMA %s", p)).Scan(&s); err != nil {
+				return nil, err
+			}
+			pragmasMap[p] = s
+		}
+		connsMap[k] = pragmasMap
+	}
+
+	return connsMap, nil
+}
+
 func (db *DB) memStats() (map[string]int64, error) {
 	ms := make(map[string]int64)
 	for _, p := range []string{
@@ -820,9 +1309,46 @@ func (db *DB) memStats() (map[string]int64, error) {
 		if err != nil {
 			return nil, err
 		}
+		if res[0].Error != "" {
+			return nil, fmt.Errorf(res[0].Error)
+		}
 		ms[p] = res[0].Values[0].Parameters[0].GetI()
 	}
 	return ms, nil
+}
+
+func createEQQueryResponse(rows *command.QueryRows, err error) *command.ExecuteQueryResponse {
+	if err != nil {
+		return &command.ExecuteQueryResponse{
+			Result: &command.ExecuteQueryResponse_Q{
+				Q: &command.QueryRows{
+					Error: err.Error(),
+				},
+			},
+		}
+	}
+	return &command.ExecuteQueryResponse{
+		Result: &command.ExecuteQueryResponse_Q{
+			Q: rows,
+		},
+	}
+}
+
+func createEQExecuteResponse(execResult *command.ExecuteResult, err error) *command.ExecuteQueryResponse {
+	if err != nil {
+		return &command.ExecuteQueryResponse{
+			Result: &command.ExecuteQueryResponse_E{
+				E: &command.ExecuteResult{
+					Error: err.Error(),
+				},
+			},
+		}
+	}
+	return &command.ExecuteQueryResponse{
+		Result: &command.ExecuteQueryResponse_E{
+			E: execResult,
+		},
+	}
 }
 
 func copyDatabase(dst *DB, src *DB) error {
@@ -892,12 +1418,38 @@ func parametersToValues(parameters []*command.Parameter) ([]interface{}, error) 
 		case *command.Parameter_S:
 			values[i] = sql.Named(parameters[i].GetName(), w.S)
 		case nil:
-			values[i] = nil
+			values[i] = sql.Named(parameters[i].GetName(), nil)
 		default:
 			return nil, fmt.Errorf("unsupported type: %T", w)
 		}
 	}
 	return values, nil
+}
+
+// populateEmptyTypes populates any empty types with the type of the parameter.
+// This is necessary because the SQLite driver doesn't return the type of the
+// column in some cases e.g. it's an expression, so we use the actual types
+// of the returned data to fill in the blanks.
+func populateEmptyTypes(types []string, params []*command.Parameter) error {
+	for i := range types {
+		if types[i] == "" {
+			switch params[i].GetValue().(type) {
+			case *command.Parameter_I:
+				types[i] = "integer"
+			case *command.Parameter_D:
+				types[i] = "real"
+			case *command.Parameter_B:
+				types[i] = "boolean"
+			case *command.Parameter_Y:
+				types[i] = "blob"
+			case *command.Parameter_S:
+				types[i] = "text"
+			default:
+				return fmt.Errorf("unsupported type: %T", params[i].GetValue())
+			}
+		}
+	}
+	return nil
 }
 
 // normalizeRowValues performs some normalization of values in the returned rows.
@@ -909,6 +1461,11 @@ func normalizeRowValues(row []interface{}, types []string) ([]*command.Parameter
 	for i, v := range row {
 		switch val := v.(type) {
 		case int:
+			values[i] = &command.Parameter{
+				Value: &command.Parameter_I{
+					I: int64(val)},
+				Name: "",
+			}
 		case int64:
 			values[i] = &command.Parameter{
 				Value: &command.Parameter_I{
@@ -985,7 +1542,16 @@ func randomString() string {
 	for i := 0; i < 20; i++ {
 		random := rand.Intn(len(chars))
 		randomChar := chars[random]
-		output.WriteString(string(randomChar))
+		output.WriteByte(randomChar)
 	}
 	return output.String()
+}
+
+func containsEmptyType(slice []string) bool {
+	for _, str := range slice {
+		if str == "" {
+			return true
+		}
+	}
+	return false
 }
